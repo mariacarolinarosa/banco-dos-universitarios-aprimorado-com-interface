@@ -1,1824 +1,1300 @@
-from datetime import date, timedelta, datetime
-import random
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+import re
 import tkinter as tk
-from tkinter import *
-import tkinter.messagebox as messagebox
+from tkinter import messagebox
+from typing import Any, Optional
 
 
 """
 AD2 - 2025.1 - PROGRAMAÇÃO COM INTERFACES GRÁFICAS
-ALUNA: Maria Carolina de Almeida Santos Rosa
+Versão revisada e refatorada.
 
-OBSERVAÇÕES IMPORTANTES:
-
-1. A credencial de acesso do Administrador é: 
-
-# n° identificação: 000
-
-2. Número da agência:  0219
+Principais correções:
+- remove estados duplicados/inconsistentes do Administrador;
+- garante número de conta único durante a execução;
+- corrige aprovação/rejeição/cancelamento de exclusão;
+- corrige saque com cheque especial e o bug de btnSacarHoje inexistente;
+- programação de operações agora realmente agenda a operação;
+- histórico usa estrutura de dados, evitando parsing frágil de strings;
+- extrato filtra datas de forma consistente;
+- evita exibir senha em texto aberto;
+- reduz criação acumulada de Frames e centraliza a troca de telas;
+- trata ausência da imagem da interface sem encerrar o programa.
 """
 
+
+AGENCIA = "0219"
+
+
+@dataclass
+class Agendamento:
+    tipo: str
+    data: date
+    valor: float
+    conta_destino: Optional[str] = None
+
+
+class Conta:
+    numeroAgencia = AGENCIA
+    _ultimo_sequencial = 10000
+
+    def __init__(self, titularConta: str, enderecoTitular: str, cpf: str, senha: str, prefixo: str = "XX"):
+        self.numeroConta = Conta._gerar_numero(prefixo)
+        self.login = self.numeroConta
+        self.saldoAtual = 0.0
+        self.historico: list[dict[str, Any]] = []
+        self.agendamentos: list[Agendamento] = []
+        self.solicitacaoExclusao: Optional[dict[str, Any]] = None
+
+        self.titularConta = self._validar_nome(titularConta)
+        self.cpf = self.validarFormatarCPF(cpf)
+        self.enderecoTitular = self._validar_endereco(enderecoTitular)
+        self.senha = self.validarSenha(senha)
+
+    @classmethod
+    def _gerar_numero(cls, prefixo: str) -> str:
+        # Usa explicitamente o contador da classe-base para que CC e CP compartilhem
+        # a mesma sequência e nunca gerem o mesmo número.
+        numero = Conta._ultimo_sequencial
+        Conta._ultimo_sequencial += 1
+        digito = numero % 10
+        return f"{prefixo}{numero:05d}-{digito}"
+
+    @staticmethod
+    def _normalizar_data(valor: date | datetime | str) -> date:
+        if isinstance(valor, datetime):
+            return valor.date()
+        if isinstance(valor, date):
+            return valor
+        return datetime.strptime(str(valor), "%d/%m/%Y").date()
+
+    @staticmethod
+    def _validar_nome(nome: str) -> str:
+        nome = str(nome).strip()
+        if not (3 <= len(nome) <= 100):
+            raise ValueError("Nome inválido. Informe nome e sobrenome.")
+        if "  " in nome:
+            raise ValueError("Nome inválido. Não use espaços duplicados.")
+        if len(nome.split()) < 2:
+            raise ValueError("Informe pelo menos nome e sobrenome.")
+
+        # Letras Unicode + espaço + apóstrofo + ponto + hífen.
+        for char in nome:
+            if not (char.isalpha() or char in " .'-"):
+                raise ValueError(
+                    "Nome inválido. Use apenas letras, espaços, hífen, apóstrofo ou ponto."
+                )
+        return nome.title()
+
+    @staticmethod
+    def _validar_endereco(endereco: str) -> str:
+        endereco = str(endereco).strip()
+        if not endereco:
+            raise ValueError("O endereço não pode ficar vazio.")
+        if endereco.replace(" ", "").isdigit():
+            raise ValueError("O endereço não pode conter apenas números.")
+        permitidos = {",", ".", "-", "/", " "}
+        for char in endereco:
+            if not (char.isalpha() or char.isdigit() or char in permitidos):
+                raise ValueError("Endereço contém caracteres não permitidos.")
+        return endereco
+
+    @staticmethod
+    def validarFormatarCPF(cpf: str) -> str:
+        cpf_limpo = re.sub(r"\D", "", str(cpf))
+        if len(cpf_limpo) != 11:
+            raise ValueError("CPF deve conter 11 dígitos.")
+        return f"{cpf_limpo[:3]}.{cpf_limpo[3:6]}.{cpf_limpo[6:9]}-{cpf_limpo[9:]}"
+
+    @staticmethod
+    def validarCpfDepositante(cpf: str) -> Optional[str]:
+        cpf_limpo = re.sub(r"\D", "", str(cpf))
+        if len(cpf_limpo) != 11:
+            return None
+        return cpf_limpo
+
+    @staticmethod
+    def validarSenha(senha: str) -> str:
+        senha = str(senha).strip()
+        if len(senha) != 6 or not senha.isdigit():
+            raise ValueError("Senha deve conter exatamente 6 dígitos numéricos.")
+        return senha
+
+    def adicionaTransacao(
+        self,
+        tipo: str,
+        valor: float,
+        data_transacao: date | datetime | str,
+        descricao: str = "",
+    ) -> None:
+        data_obj = self._normalizar_data(data_transacao)
+        self.historico.append(
+            {
+                "tipo": tipo,
+                "valor": float(valor),
+                "data": data_obj,
+                "descricao": descricao,
+            }
+        )
+
+    # Compatibilidade com chamadas antigas.
+    def adicionaTransacaoHistorico(self, transacao: str) -> None:
+        # Mantém uma única API interna estruturada. Este método existe para não quebrar
+        # código externo que ainda envie uma string.
+        self.historico.append(
+            {
+                "tipo": "Registro",
+                "valor": 0.0,
+                "data": date.today(),
+                "descricao": str(transacao),
+            }
+        )
+
+    def formatar_transacao(self, transacao: dict[str, Any]) -> str:
+        valor = transacao["valor"]
+        data_str = transacao["data"].strftime("%d/%m/%Y")
+        tipo = transacao["tipo"]
+        if tipo in {"Taxa de manutenção projetada", "Rendimento projetado", "Rendimento total projetado"}:
+            return f"{tipo} - R$ {abs(valor):.2f} - {data_str}"
+        if tipo == "Saldo projetado":
+            return f"{tipo}: R$ {valor:.2f} - {data_str} - {transacao.get('descricao', '')}".rstrip(" -")
+        texto = f"{tipo} - R$ {abs(valor):.2f} - {data_str}"
+        if transacao.get("descricao"):
+            texto += f" - {transacao['descricao']}"
+        return texto
+
+    def saldo_disponivel(self) -> float:
+        if isinstance(self, ContaCorrente):
+            return self.saldoAtual + self.limiteChequeEspecial
+        return self.saldoAtual
+
+    def solicitarExclusaoConta(self) -> None:
+        if self.solicitacaoExclusao is not None:
+            raise ValueError("Já existe uma solicitação ativa para esta conta.")
+        solicitacao = {
+            "numero_conta": self.numeroConta,
+            "titular": self.titularConta,
+            "tipo_conta": self.__class__.__name__,
+            "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "status": "pendente",
+        }
+        Administrador.adicionarSolicitacao(solicitacao)
+        self.solicitacaoExclusao = solicitacao
+
+    def agendar(self, tipo: str, valor: float, data_agendada: date, conta_destino: Optional[str] = None) -> None:
+        if data_agendada <= date.today():
+            raise ValueError("A data agendada deve ser futura.")
+        if valor <= 0:
+            raise ValueError("O valor deve ser positivo.")
+        self.agendamentos.append(
+            Agendamento(tipo=tipo, data=data_agendada, valor=float(valor), conta_destino=conta_destino)
+        )
+
+    def cancelar_agendamento(self, indice: int) -> None:
+        try:
+            self.agendamentos.pop(indice)
+        except IndexError as exc:
+            raise ValueError("Agendamento inválido.") from exc
+
+    @staticmethod
+    def depositar(conta: "Conta", valor: float, data_transacao: date, descricao: str = "") -> None:
+        if valor <= 0:
+            raise ValueError("O valor do depósito deve ser positivo.")
+
+        valor_original = valor
+        if isinstance(conta, ContaCorrente):
+            # Primeiro recompõe eventual cheque especial utilizado.
+            deficit = conta.limiteChequeEspecialOriginal - conta.limiteChequeEspecial
+            if deficit > 0:
+                recomposicao = min(valor, deficit)
+                conta.limiteChequeEspecial += recomposicao
+                valor -= recomposicao
+
+        conta.saldoAtual += valor
+        conta.adicionaTransacao("Depósito", valor_original, data_transacao, descricao)
+
+    @staticmethod
+    def sacar(conta: "Conta", valor: float, data_transacao: date, permitir_cheque: bool = True) -> tuple[bool, float]:
+        if valor <= 0:
+            return False, 0.0
+
+        if isinstance(conta, ContaPoupanca):
+            if valor > conta.saldoAtual:
+                return False, 0.0
+            conta.saldoAtual -= valor
+            conta.adicionaTransacao("Saque", valor, data_transacao)
+            return True, 0.0
+
+        # Conta corrente.
+        if valor <= conta.saldoAtual:
+            conta.saldoAtual -= valor
+            conta.adicionaTransacao("Saque", valor, data_transacao)
+            return True, 0.0
+
+        valor_cheque = valor - conta.saldoAtual
+        if not permitir_cheque or valor_cheque > conta.limiteChequeEspecial:
+            return False, valor_cheque
+
+        conta.saldoAtual -= valor
+        conta.limiteChequeEspecial -= valor_cheque
+        conta.adicionaTransacao(
+            "Saque com cheque especial",
+            valor,
+            data_transacao,
+            f"Cheque especial utilizado: R$ {valor_cheque:.2f}",
+        )
+        return True, valor_cheque
+
+
+class ContaCorrente(Conta):
+    TAXA_MANUTENCAO = 15.00
+
+    def __init__(self, titularConta: str, enderecoTitular: str, cpf: str, senha: str):
+        super().__init__(titularConta, enderecoTitular, cpf, senha, prefixo="CC")
+        self.login = self.numeroConta
+        self.limiteChequeEspecialOriginal = 100.00
+        self.limiteChequeEspecial = self.limiteChequeEspecialOriginal
+        self.tipoContaCriada = "CORRENTE"
+        Administrador.adicionarContaCorrente(self)
+
+
+class ContaPoupanca(Conta):
+    TAXA_RENDIMENTO = 0.005
+    DIAS_ANIVERSARIO = 30
+
+    def __init__(self, titularConta: str, enderecoTitular: str, cpf: str, senha: str):
+        super().__init__(titularConta, enderecoTitular, cpf, senha, prefixo="CP")
+        self.login = self.numeroConta
+        self.tipoContaCriada = "POUPANÇA"
+        Administrador.adicionarContaPoupanca(self)
+
+
 class Administrador:
-    
     __usuario = "Admin"
     __codigo = "000"
-    __contasCorrenteCadastradas = []
-    __contasPoupancaCadastradas = []
-    __solicitacoes = []
-    __contasParaExclusao = []
-    __solicitacoesPendentes = []  # Lista de dicionários com todas as informações
-    __contasParaExclusao = []    # Lista apenas com números de conta
+    __contasCorrenteCadastradas: list[ContaCorrente] = []
+    __contasPoupancaCadastradas: list[ContaPoupanca] = []
+    __solicitacoesPendentes: list[dict[str, Any]] = []
 
-    #Usado classe Interface para identificar o acesso do Administrador
     @classmethod
-    def getUsuario(cls):
+    def getUsuario(cls) -> str:
         return cls.__usuario
 
-    #Utilizado na classe Interface para identificar o acesso do Administrador
     @classmethod
-    def getCodigo(cls):
+    def getCodigo(cls) -> str:
         return cls.__codigo
 
-    #Realiza a exclusão das contas
     @classmethod
-    def excluirContas(cls, numeroConta):
-        # Verifica contas correntes
-        for conta in cls.__contasCorrenteCadastradas:
-            if numeroConta == conta.numeroConta:
-                cls.__contasCorrenteCadastradas.remove(conta)
-                return
-
-        # Verifica contas poupança
-        for conta in cls.__contasPoupancaCadastradas:
-            if numeroConta == conta.numeroConta:
-                cls.__contasPoupancaCadastradas.remove(conta)
-                return
-
-    #Recebe as solicitações enviadas pelo cliente e armazena no vetor solicitacoes/contasParaExclusao
-    @classmethod
-    def recebeSolicitacao(cls, solicitacao):
-        if solicitacao['numero_conta'] in cls.__contasParaExclusao:
-            raise Exception("Já existe solicitação pendente para esta conta")
-        
-        cls.__solicitacoes.append(solicitacao)
-        cls.__contasParaExclusao.append(solicitacao['numero_conta'])
-            
-    @classmethod
-    def adicionarContaCorrente(cls, conta):
+    def adicionarContaCorrente(cls, conta: ContaCorrente) -> None:
         cls.__contasCorrenteCadastradas.append(conta)
 
-    #Adiciona as contas correntes criadas a um vetor, para controle do Administrador
     @classmethod
-    def adicionarContaPoupanca(cls, conta):
+    def adicionarContaPoupanca(cls, conta: ContaPoupanca) -> None:
         cls.__contasPoupancaCadastradas.append(conta)
 
-    #Retornará uma cópia da lista contendo as contas corrente. Utilizada para validar a existência da conta, durante as transações. 
     @classmethod
-    def get__contasCorrenteCadastradas(cls):
-        return cls.__contasCorrenteCadastradas.copy() #retornará uma cópia da lista
+    def get__contasCorrenteCadastradas(cls) -> list[ContaCorrente]:
+        return cls.__contasCorrenteCadastradas.copy()
 
-    #Retornará uma cópia da lista contendo as contas poupança. Utilizada para validar a existência da conta, durante as transações. 
     @classmethod
-    def get__contasPoupancaCadastradas(cls):
-        return cls.__contasPoupancaCadastradas.copy() #retornará uma cópia da lista
-    
-    #Utiliza o número da conta e a agência para verificar se o cliente possui cadastro
+    def get__contasPoupancaCadastradas(cls) -> list[ContaPoupanca]:
+        return cls.__contasPoupancaCadastradas.copy()
+
     @classmethod
-    def verificaSeExisteCadastro(cls, numeroConta, agencia): 
+    def todasContas(cls) -> list[Conta]:
+        return cls.__contasCorrenteCadastradas.copy() + cls.__contasPoupancaCadastradas.copy()
 
-        if len(cls.__contasCorrenteCadastradas) > 0:
-            for i in range(len(cls.__contasCorrenteCadastradas)):
-                if numeroConta == cls.__contasCorrenteCadastradas[i].numeroConta and agencia == cls.__contasCorrenteCadastradas[i].numeroAgencia:
-                    conta = cls.__contasCorrenteCadastradas[i]
-                    return conta
-
-        if len(cls.__contasPoupancaCadastradas) > 0:
-            for i in range(len(cls.__contasPoupancaCadastradas)):
-                if numeroConta == cls.__contasPoupancaCadastradas[i].numeroConta and agencia == cls.__contasPoupancaCadastradas[i].numeroAgencia:
-                    conta = cls.__contasPoupancaCadastradas[i]
-                    return conta
-
-        messagebox.showerror("Erro!","Usuário não cadastrado.")
+    @classmethod
+    def buscarConta(cls, numeroConta: str) -> Optional[Conta]:
+        numeroConta = str(numeroConta).strip().upper()
+        for conta in cls.todasContas():
+            if conta.numeroConta.upper() == numeroConta:
+                return conta
         return None
 
-    #Atualiza o endereço das contas dos clientes que possuem mesmo nome e CPF
     @classmethod
-    def alterarEnderecoPorNome(cls, titularConta, novoEndereco, cpf):
-        contasAlteradas = 0
-        
-        for conta in cls.__contasCorrenteCadastradas:
-            if conta.titularConta == titularConta and conta.cpf == cpf:
-                conta.enderecoTitular = novoEndereco  # Atualiza diretamente
-                contasAlteradas += 1
-                
-        for conta in cls.__contasPoupancaCadastradas:
-            if conta.titularConta == titularConta and conta.cpf == cpf:
-                conta.enderecoTitular = novoEndereco  # Atualiza diretamente
-                contasAlteradas += 1
-                
-        return contasAlteradas 
+    def verificaSeExisteCadastro(cls, numeroConta: str, agencia: str) -> Optional[Conta]:
+        agencia = str(agencia).strip()
+        numeroConta = str(numeroConta).strip().upper()
+        conta = cls.buscarConta(numeroConta)
+        if conta and conta.numeroAgencia == agencia:
+            return conta
+        return None
 
-
-#------------------------------FUNÇÕES CRIADAS NA CLASSE ADMINISTRADDOR PARA AUXILIAR NA IMPLEMENTAÇÃO DA INTERFACE -----------------------------------------
-
-    #Adiciona solitação de exclusão às respectivas listas
     @classmethod
-    def adicionarSolicitacao(cls, solicitacao):
-        if solicitacao['numero_conta'] in cls.__contasParaExclusao:
-            raise ValueError("Já existe solicitação pendente para esta conta")
-        
+    def excluirContas(cls, numeroConta: str) -> None:
+        conta = cls.buscarConta(numeroConta)
+        if conta is None:
+            raise ValueError("Conta não encontrada.")
+        if isinstance(conta, ContaCorrente):
+            cls.__contasCorrenteCadastradas.remove(conta)
+        else:
+            cls.__contasPoupancaCadastradas.remove(conta)
+
+    @classmethod
+    def adicionarSolicitacao(cls, solicitacao: dict[str, Any]) -> None:
+        numero = solicitacao["numero_conta"]
+        if any(s["numero_conta"] == numero for s in cls.__solicitacoesPendentes):
+            raise ValueError("Já existe solicitação pendente para esta conta.")
         cls.__solicitacoesPendentes.append(solicitacao)
-        cls.__contasParaExclusao.append(solicitacao['numero_conta'])
-        # print(f"Solicitação registrada: {solicitacao}")
 
-    #Exibe as solicitações enviadas na interface
     @classmethod
-    def listarSolicitacoes(cls):
+    def listarSolicitacoes(cls) -> list[str]:
         return [
             f"ID: {idx} | Conta: {s['numero_conta']} | Titular: {s['titular']} | "
             f"Tipo: {s['tipo_conta']} | Data: {s['data']}"
             for idx, s in enumerate(cls.__solicitacoesPendentes, 1)
         ]
 
-    #Aprova o pedido de exclusão de conta
     @classmethod
-    def aprovarExclusao(cls, id_solicitacao):
-        try:
-            solicitacao = cls.__solicitacoesPendentes.pop(id_solicitacao - 1)
-            cls.excluirContas(solicitacao['numero_conta'])
-            return f"Conta {solicitacao['numero_conta']} excluída com sucesso"
-        except IndexError:
-            raise ValueError("ID de solicitação inválido")
-   
-    #Rejeita o pedido de exclusão de conta
+    def aprovarExclusao(cls, id_solicitacao: int) -> str:
+        if id_solicitacao < 1 or id_solicitacao > len(cls.__solicitacoesPendentes):
+            raise ValueError("ID de solicitação inválido.")
+        solicitacao = cls.__solicitacoesPendentes.pop(id_solicitacao - 1)
+        numero = solicitacao["numero_conta"]
+        conta = cls.buscarConta(numero)
+        if conta is None:
+            raise ValueError("A conta associada à solicitação não existe mais.")
+        cls.excluirContas(numero)
+        conta.solicitacaoExclusao = None
+        return f"Conta {numero} excluída com sucesso."
+
     @classmethod
-    def rejeitarExclusao(cls, id_solicitacao):
-        try:
-            solicitacao = cls.__solicitacoesPendentes.pop(id_solicitacao - 1)
-            cls.__contasParaExclusao.remove(solicitacao['numero_conta'])
-            return f"Solicitação da conta {solicitacao['numero_conta']} rejeitada"
-        except IndexError:
-            raise ValueError("ID de solicitação inválido")
-        
-    #Lista solicitações pendentes
+    def rejeitarExclusao(cls, id_solicitacao: int) -> str:
+        if id_solicitacao < 1 or id_solicitacao > len(cls.__solicitacoesPendentes):
+            raise ValueError("ID de solicitação inválido.")
+        solicitacao = cls.__solicitacoesPendentes.pop(id_solicitacao - 1)
+        conta = cls.buscarConta(solicitacao["numero_conta"])
+        if conta:
+            conta.solicitacaoExclusao = None
+        return f"Solicitação da conta {solicitacao['numero_conta']} rejeitada."
+
     @classmethod
-    def listarSolicitacoesPendentes(cls, tipo_conta=None):
-        solicitacoes = cls.__solicitacoesPendentes.copy()
-        
-        if tipo_conta:  # 'ContaCorrente' ou 'ContaPoupanca'
-            solicitacoes = [s for s in solicitacoes if s['tipo_conta'] == tipo_conta]
-        
-        return solicitacoes or "Nenhuma solicitação encontrada."
-
-    #Cancela o pedido de exclusão de conta
-    @classmethod
-    def cancelarSolicitacao(cls, numero_conta):
-        cls.__solicitacoesPendentes = [s for s in cls.__solicitacoesPendentes
-                                    if s['numero_conta'] != numero_conta]
-        if numero_conta in cls.__contasParaExclusao:
-            cls.__contasParaExclusao.remove(numero_conta)
-
-    # Retorna o status formatado para exibição
-    @classmethod
-    def verificarStatusExclusao(cls, numero_conta):
-        if numero_conta in cls.__contasParaExclusao:
-            return "Solicitação em análise (pendente)"
-        return "Conta ativa (sem solicitação)"
-#--------------------------------------------------------------------------------------------
-
-class Conta:
-    numeroAgencia = "0219" #Supondo que o Banco dos Universitários possui apenas 1 agência, todas as contas do exemplo receberam o mesmo número.
-    numeroConta = 0
-
-    #Construtor
-    def __init__(self, titularConta, enderecoTitular, cpf, senha):
-        # Geração do número da conta (mantido igual)
-        Conta.numeroConta += 1
-        self.numeroConta = f"C: {Conta.numeroConta}"
-        self.login = self.numeroConta
-        self.saldoAtual = 0.0
-        self.historico = []
-        
-        # Validação e atribuição do nome
-        nome = str(titularConta).strip()
-        if not self.validarNome(nome):    
-            raise ValueError("Nome inválido. Deve conter nome e sobrenome, não possuir números ou caracteres especiais, exceto: - . '.")
-        self.titularConta = nome.title()  
-
-         # Validação do CPF
-        self.cpf = self.validarFormatarCPF(cpf)
-
-        # Validação do endereço
-        self.enderecoTitular = str(enderecoTitular).strip()
-        if not self.validarEndereco(self.enderecoTitular):
-            raise ValueError("Endereço deve conter letras e não pode ter apenas números")
-
-        # Validação da senha
-        self.senha = self.validarSenha(senha)
-
-    #Utilizado para adicionar transações ao histórico da conta
-    def adicionaTransacaoHistorico(self,transacao):
-        self.historico.append(transacao)
-
-
-    #Depósito sem login ou para clientes não cadastrados
-    @classmethod
-    def depositarSemlogar(cls, contaBeneficiada, cpf, valor):
-        # Validação básica
-        if not all([contaBeneficiada, cpf, valor]):
-            messagebox.showerror("Erro", "Todos os campos devem ser preenchidos.")
-            return False
-
-        try:
-            valor = float(valor)
-            if valor <= 0:
-                messagebox.showerror("Erro", "Valor deve ser positivo.")
-                return False
-        except ValueError:
-            messagebox.showerror("Erro", "Valor inválido para depósito.")
-            return False
-
-        # Busca a conta
-        conta = None
-        for cc in Administrador.get__contasCorrenteCadastradas():
-            if contaBeneficiada == cc.numeroConta:
-                conta = cc
-                break
-        
-        if not conta:
-            for cp in Administrador.get__contasPoupancaCadastradas():
-                if contaBeneficiada == cp.numeroConta:
-                    conta = cp
-                    break
-
-        if not conta:
-            messagebox.showerror("Erro", f"Conta {contaBeneficiada} não encontrada!")
-            return False
-
-        # Valida CPF
-        if not cls.validarCpfDepositante(cpf):
-            return False
-
-        # Processa o depósito
-        data = date.today().strftime("%d/%m/%Y")
-        conta.saldoAtual += valor
-        transacao = f"Depósito externo - R$ {valor:.2f} - {data} - CPF depositante: {cpf}"
-        conta.adicionaTransacaoHistorico(transacao)
-        
-        messagebox.showinfo("Sucesso", 
-            f"Depósito de R$ {valor:.2f} realizado na conta {conta.numeroConta}!")
-        return True
-
-    #Envia a solicitação de exclusão para o administardor do sistema
-    def solicitarExclusaoConta(self):
-        if hasattr(self, 'solicitacaoExclusao'):
-            raise ValueError("Já existe uma solicitação ativa para esta conta")
-        
-        solicitacao = {
-            'numero_conta': self.numeroConta,
-            'titular': self.titularConta,
-            'tipo_conta': self.__class__.__name__,
-            'data': datetime.now().strftime("%d/%m/%Y %H:%M"),
-            'status': 'pendente'
-        }
-        
-        Administrador.adicionarSolicitacao(solicitacao)
-        self.solicitacaoExclusao = solicitacao  # Armazena localmente
-
-    #Método que efetivamente executa a alteração do endereço
-    def alterarEndereco(self, novoEndereco):
-        self.enderecoTitular = novoEndereco
-    
-    #Método de validação e formatação do CPF, limita a quantidade de digitos e formata para o padrão conhecido xxx.xxx.xxx-xx
-    def validarFormatarCPF(self, cpf):
-        cpf = ''.join(filter(str.isdigit, str(cpf)))
-        if len(cpf) != 11:
-            raise ValueError("CPF deve conter 11 dígitos")
-        return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
-
-    #Método estático para validar o CPF em depósito de visitante.
-    @staticmethod
-    def validarCpfDepositante(cpfPassadoComoParametro):
-        while True:
-            cpf = cpfPassadoComoParametro
-            cpfLimpo = ''.join(filter(str.isdigit, cpf))  # Remove caracteres não numéricos
-            
-            if len(cpfLimpo) == 11 and cpfLimpo.isdigit():
-                return cpfLimpo  # Retorna o CPF válido (apenas números)
+    def cancelarSolicitacao(cls, numero_conta: str) -> None:
+        encontrou = False
+        restante = []
+        for solicitacao in cls.__solicitacoesPendentes:
+            if solicitacao["numero_conta"] == numero_conta:
+                encontrou = True
             else:
-                messagebox.showerror("Erro.",
-                                     "CPF deve conter 11 digitos numéricos.")
-            return None
+                restante.append(solicitacao)
+        cls.__solicitacoesPendentes = restante
+        if not encontrou:
+            raise ValueError("Não existe solicitação pendente para esta conta.")
 
-    #Valida a senha, limitando a 6 digitos numéricos
-    @staticmethod
-    def validarSenha(senha):
-        senha = ''.join(filter(str.isdigit, str(senha)))
-        if len(senha) != 6:
-            raise ValueError("Senha deve conter 6 dígitos númericos")
-        return senha
+    @classmethod
+    def verificarStatusExclusao(cls, numero_conta: str) -> str:
+        pendente = any(s["numero_conta"] == numero_conta for s in cls.__solicitacoesPendentes)
+        return "Solicitação em análise (pendente)" if pendente else "Conta ativa (sem solicitação)"
 
-    #Garante que o nome não será vazio, ou contenha digitos numéricos. Alguns caracteres especiais como ' e . são permitidos (pois alguns nomes/sobrenomes os utilizam).
-    @staticmethod
-    def validarNome(titularConta):
-        # Verifica se é string e remove espaços extras
-        if not isinstance(titularConta, str):
-            return False
-        nome = titularConta.strip()
-        
-        # Validações básicas
-        if not nome or len(nome) < 3:  # Nome muito curto
-            return False
-        
-        if len(nome) > 100:  # Nome muito longo
-            return False
-        
-        if "  " in nome:  # Múltiplos espaços
-            return False
-        
-        # Verifica cada caractere individualmente
-        caracteresPermitidos = (" ", "'", ".")  # Caracteres especiais permitidos
-        for char in nome:
-            if not (char.isalpha() or char in caracteresPermitidos):
-                # Permite letras acentuadas (considerando Unicode)
-                if char.lower() not in 'áéíóúâêîôûãõàèìòùäëïöüç':
-                    return False
-        
-        # Verifica se tem pelo menos nome e sobrenome
-        if len(nome.split()) < 2:
-            return False
-        
-        return True
-    
-    #Garante que o endereço não estará vazio, e que não possua caracteres especiais inadequados.
-    @staticmethod
-    def validarEndereco(endereco):
-        endereco = str(endereco).strip()
-        
-        # Verifica se está vazio ou contém apenas espaços
-        if not endereco:
-            return False
-        
-        # Verifica se contém APENAS números (não permitido)
-        if endereco.replace(" ", "").isdigit():
-            return False
-        
-        # Verifica caracteres permitidos (letras, números e alguns símbolos)
-        caracteresPermitidos = {',', '.', '-', ' '}
-        for char in endereco:
-            if not (char.isalpha() or char.isdigit() or char in caracteresPermitidos):
-                return False
-        
-        return True
-    
-class ContaCorrente(Conta):
-    numeroContaCorrente = 0
-    TAXA_MANUTENCAO = 15.00
+    @classmethod
+    def alterarEnderecoPorNome(cls, titularConta: str, novoEndereco: str, cpf: str) -> int:
+        novoEndereco = Conta._validar_endereco(novoEndereco)
+        cpf_normalizado = Conta.validarFormatarCPF(cpf)
+        alteradas = 0
+        for conta in cls.todasContas():
+            if conta.titularConta == titularConta and conta.cpf == cpf_normalizado:
+                conta.enderecoTitular = novoEndereco
+                alteradas += 1
+        return alteradas
 
-    #Construtor
-    def __init__(self, titularConta, enderecoTitular, cpf, senha):
-        # Simplesmente repassa todos os parâmetros para o construtor da superclasse
-        super().__init__(titularConta, enderecoTitular, cpf, senha)
-        ContaCorrente.numeroContaCorrente += 1
-        self.numeroConta = f"CC{random.randint(10000, 99999)}-{random.randint(0,9)}" 
-        self.limiteChequeEspecial = 100.00
-        self.tipoContaCriada = "CORRENTE"
-        self.login = self.numeroConta #Login definido como o numero da conta
-        print(f"{titularConta.upper()}, seu login: {self.numeroConta} + agência: {Conta.numeroAgencia}")
+    @classmethod
+    def processarAgendamentos(cls, data_referencia: Optional[date] = None) -> list[str]:
+        data_ref = data_referencia or date.today()
+        mensagens: list[str] = []
 
-        Administrador.adicionarContaCorrente(self)
+        # Cópia evita alteração da lista durante iteração.
+        for conta in cls.todasContas():
+            vencidos = [a for a in conta.agendamentos if a.data <= data_ref]
+            conta.agendamentos = [a for a in conta.agendamentos if a.data > data_ref]
 
-    #Simula a aplicação da taxa de manutenção para a projeção do histórico e ordena as transações em ordem crecente
-    def aplicarTaxaManutencaoPeriodo(self, meses, dataFinal, transacoesFiltradas):
-        # Cria uma lista combinada de transações reais + taxas projetadas
-        historico_completo = transacoesFiltradas.copy()
-        saldoTemp = self.saldoAtual  # Cópia temporária do saldo (apenas para cálculo)
-        
-        for i in range(meses):
-            # Calcula a data correta para cada taxa (dia 5 de cada mês, por exemplo)
-            data_taxa = dataFinal.replace(day=5) - timedelta(days=(meses - i - 1) * 30)
-            
-            # Adiciona a taxa ao histórico combinado
-            historico_completo.append(
-                f"Taxa de Manutenção Projetada - R$ {self.TAXA_MANUTENCAO:.2f} - {data_taxa.strftime('%d/%m/%Y')}")
-            saldoTemp -= self.TAXA_MANUTENCAO  # Atualiza saldo temporário
-        
-        # Ordena todas as transações por data
-        historico_ordenado = sorted(historico_completo, key=lambda x: datetime.strptime(x.split(" - ")[2], "%d/%m/%Y"))
-
-class ContaPoupanca(Conta):        
-
-    #Construtor
-    def __init__(self, titularConta, enderecoTitular, cpf, senha):
-        super().__init__(titularConta, enderecoTitular, cpf, senha)
-        self.numeroConta = f"CP{random.randint(10000, 99999)}-{random.randint(0,9)}"
-        Administrador.adicionarContaPoupanca(self)
-        print(f"{titularConta.upper()}, seu login: {self.numeroConta} + agência: {Conta.numeroAgencia}")
-        self.TAXA_RENDIMENTO = 0.005 
-        self.tipoContaCriada = "POUPANÇA"
-        self.DIAS_ANIVERSARIO = 30 
-
-    #Implementa o cálculo dos rendimentos
-    def calcularRendimentoAniversario(self, dataInicial, dataFinal, transacoesFiltradas):
-        historico_temp = transacoesFiltradas.copy()
-        saldoTemp = self.saldoAtual
-        rendimentoTotal = 0
-
-        # 1. Filtrar apenas depósitos/transferências recebidas
-        transacoes_entrada = []
-        for transacao in transacoesFiltradas:
-            if any(t in transacao for t in ["Depósito", "Transferência recebida"]):
-                try:
-                    partes = transacao.split(" - ")
-                    # Corrige a extração do valor (remove R$ e espaços, trata vírgulas)
-                    valor_str = partes[1].replace("R$", "").replace(" ", "").replace(",", ".")
-                    valor = float(valor_str)
-                    data_transacao = datetime.strptime(partes[2].strip(), "%d/%m/%Y").date()
-                    transacoes_entrada.append((valor, data_transacao, transacao))
-                except (IndexError, ValueError, AttributeError) as e:
-                    print(f"Erro ao processar transação: {transacao} | Erro: {str(e)}")
+            for ag in sorted(vencidos, key=lambda x: x.data):
+                if ag.tipo == "Depósito":
+                    Conta.depositar(conta, ag.valor, ag.data, "Operação agendada")
+                    mensagens.append(f"Depósito agendado executado na conta {conta.numeroConta}.")
                     continue
 
-        # 2. Para cada transação válida, calcular os rendimentos
-        for valor, data_transacao, transacao_original in transacoes_entrada:
-            print(f"\nCalculando rendimentos para: {transacao_original}")
-            
-            dias_corridos = (dataFinal - data_transacao).days
-            ciclos = dias_corridos // 30
+                if ag.tipo == "Saque":
+                    ok, usado = Conta.sacar(conta, ag.valor, ag.data, permitir_cheque=True)
+                    if ok:
+                        mensagens.append(f"Saque agendado executado na conta {conta.numeroConta}.")
+                    else:
+                        conta.adicionaTransacao(
+                            "Agendamento não executado",
+                            0.0,
+                            ag.data,
+                            f"Saque de R$ {ag.valor:.2f} sem saldo disponível",
+                        )
+                        mensagens.append(f"Saque agendado não executado na conta {conta.numeroConta}.")
+                    continue
 
-            if ciclos > 0:
-                for ciclo in range(1, ciclos + 1):
-                    data_aniversario = data_transacao + timedelta(days=30 * ciclo)
-                    
-                    if data_aniversario <= dataFinal:
-                        rendimento = valor * self.TAXA_RENDIMENTO
-                        rendimentoTotal += rendimento
-                        
-                        descricao = (f"Rendimento (aniv. {ciclo}°) - R$ {rendimento:.2f} - "
-                                    f"{data_aniversario.strftime('%d/%m/%Y')} "
-                                    f"(origem: {data_transacao.strftime('%d/%m/%Y')})")
-                        historico_temp.append(descricao)
-                        print(f"- {descricao}")
+                if ag.tipo == "Transferência":
+                    destino = cls.buscarConta(ag.conta_destino or "")
+                    if destino is None or destino is conta:
+                        conta.adicionaTransacao(
+                            "Agendamento não executado",
+                            0.0,
+                            ag.data,
+                            "Conta destino inválida",
+                        )
+                        mensagens.append(f"Transferência agendada não executada: destino inválido ({conta.numeroConta}).")
+                        continue
 
-        # 3. Ordena e exibe
-        historico_ordenado = sorted(historico_temp, key=lambda x: datetime.strptime(x.split(" - ")[2].split()[0], "%d/%m/%Y"))
+                    ok, usado = Conta.sacar(conta, ag.valor, ag.data, permitir_cheque=True)
+                    if not ok:
+                        conta.adicionaTransacao(
+                            "Agendamento não executado",
+                            0.0,
+                            ag.data,
+                            f"Transferência de R$ {ag.valor:.2f} sem saldo disponível",
+                        )
+                        mensagens.append(f"Transferência agendada não executada na conta {conta.numeroConta}.")
+                        continue
+
+                    destino.saldoAtual += ag.valor
+                    destino.adicionaTransacao(
+                        "Transferência recebida",
+                        ag.valor,
+                        ag.data,
+                        f"De: {conta.numeroConta}",
+                    )
+                    # Acrescenta o detalhe à última transação da origem.
+                    conta.historico[-1]["descricao"] += f" | Para: {destino.numeroConta}"
+                    mensagens.append(f"Transferência agendada executada: {conta.numeroConta} → {destino.numeroConta}.")
+
+        return mensagens
+
+    @classmethod
+    def resetarDados(cls) -> None:
+        # Útil para testes automatizados.
+        cls.__contasCorrenteCadastradas.clear()
+        cls.__contasPoupancaCadastradas.clear()
+        cls.__solicitacoesPendentes.clear()
+        Conta._ultimo_sequencial = 10000
+
+
+def gerar_rendimentos_poupanca(conta: ContaPoupanca, data_inicial: date, data_final: date) -> list[dict[str, Any]]:
+    """Projeta rendimentos de 0,5% a cada 30 dias sobre depósitos/entradas."""
+    projetados: list[dict[str, Any]] = []
+    for transacao in conta.historico:
+        if transacao["tipo"] not in {"Depósito", "Transferência recebida"}:
+            continue
+        origem = transacao["data"]
+        valor = transacao["valor"]
+        ciclo = 1
+        while True:
+            aniversario = origem + timedelta(days=30 * ciclo)
+            if aniversario > data_final:
+                break
+            if aniversario >= data_inicial:
+                rendimento = valor * conta.TAXA_RENDIMENTO
+                projetados.append(
+                    {
+                        "tipo": "Rendimento projetado",
+                        "valor": rendimento,
+                        "data": aniversario,
+                        "descricao": f"Origem: {origem.strftime('%d/%m/%Y')}",
+                    }
+                )
+            ciclo += 1
+    return projetados
+
+
+def gerar_taxas_corrente(conta: ContaCorrente, data_inicial: date, data_final: date) -> list[dict[str, Any]]:
+    taxas: list[dict[str, Any]] = []
+    ano, mes = data_inicial.year, data_inicial.month
+    data_taxa = date(ano, mes, 5)
+    if data_taxa < data_inicial:
+        if mes == 12:
+            data_taxa = date(ano + 1, 1, 5)
+        else:
+            data_taxa = date(ano, mes + 1, 5)
+
+    while data_taxa <= data_final:
+        taxas.append(
+            {
+                "tipo": "Taxa de manutenção projetada",
+                "valor": conta.TAXA_MANUTENCAO,
+                "data": data_taxa,
+                "descricao": "Projeção",
+            }
+        )
+        if data_taxa.month == 12:
+            data_taxa = date(data_taxa.year + 1, 1, 5)
+        else:
+            data_taxa = date(data_taxa.year, data_taxa.month + 1, 5)
+    return taxas
+
+
+def transferir(conta_origem: Conta, conta_destino: Conta, valor: float, data_transacao: date, permitir_cheque: bool = True) -> tuple[bool, float]:
+    if valor <= 0:
+        return False, 0.0
+    if conta_origem is conta_destino:
+        return False, 0.0
+
+    ok, usado = Conta.sacar(conta_origem, valor, data_transacao, permitir_cheque=permitir_cheque)
+    if not ok:
+        return False, usado
+
+    conta_destino.saldoAtual += valor
+    conta_destino.adicionaTransacao(
+        "Transferência recebida",
+        valor,
+        data_transacao,
+        f"De: {conta_origem.numeroConta}",
+    )
+    conta_origem.historico[-1]["descricao"] += f" | Para: {conta_destino.numeroConta}"
+    return True, usado
+
 
 class Janela:
-    def __init__(self): #Construtor
-        self.janelaPrincipal = Tk()
-        self.janelaPrincipal.configure(bg='#E3F2F9')
-        self.janelaPrincipal.geometry("420x600")
+    BG = "#E3F2F9"
+    PRIMARY = "#78D1DE"
+    DANGER = "#D26060"
+    TEXT = "#223C5E"
+
+    def __init__(self):
+        self.janelaPrincipal = tk.Tk()
+        self.janelaPrincipal.configure(bg=self.BG)
+        self.janelaPrincipal.geometry("520x680")
+        self.janelaPrincipal.minsize(520, 680)
         self.janelaPrincipal.title("Banco dos Universitários")
-        self.nomeMenu = None
-        self.contaLogin = None #Será que dá ruim?
-
-        #Váriaveis responsáveis por armazenar os Frames
-        self.menuLogin = None
-        self.menuPrincipal = None
-        self.menuAberturaDeConta = None
-        self.menuAberturaDeContaCorrentePoupanca = None
-        self.informacoesContaCliente = None
-        self.informacoesContaAdministrador = None
-        self.menuDepositoExpress = None
-        self.telaPosCadastro = None
-        self.menuLoginAdministrador = None
-        self.menuLoginCliente = None
-        self.menuAdministrador = None
-        self.menuCliente = None
-        self.trasacoesBancarias = None
-        self.gerenciamentoDeContasAdministrador = None
-        self.menuDepositoLogado = None
-        self.menuSaque = None
-        self.menuTransferir = None
-        self.menuAlteracaoEndereco = None
-        self.telaExclusaoConta = None
-        self.telaAcompanhamentoExclusaoConta = None
-        self.menuExtrato = None
-        
-        #Cria o menu principal
+        self.contaLogin: Optional[Conta] = None
+        self.tipoConta: Optional[str] = None
+        self.telaAtual: Optional[tk.Frame] = None
+        self.logo = self._carregar_logo()
         self.criarMenuPrincipal()
-
-        #Chama função que evita interrupção
         self.configurarProtecaoTeclado()
 
-    #Exibe a janela principal
+    def _carregar_logo(self):
+        try:
+            return tk.PhotoImage(file="ImagemTelaPrincipal.png")
+        except tk.TclError:
+            return None
+
+    def _nova_tela(self) -> tk.Frame:
+        if self.telaAtual is not None and self.telaAtual.winfo_exists():
+            self.telaAtual.destroy()
+        self.telaAtual = tk.Frame(self.janelaPrincipal, bg=self.BG, padx=20, pady=20)
+        self.telaAtual.pack(fill="both", expand=True)
+        return self.telaAtual
+
+    def _cabecalho(self, parent: tk.Frame, titulo: str) -> None:
+        if self.logo is not None:
+            tk.Label(parent, image=self.logo, bg=self.BG, bd=0).pack(pady=(0, 10))
+        tk.Label(
+            parent,
+            text=titulo,
+            bg=self.BG,
+            font=("Arial", 13, "bold"),
+            fg=self.TEXT,
+        ).pack(pady=(0, 15))
+
+    def _botao(self, parent, texto, comando, destaque=True, danger=False):
+        bg = self.DANGER if danger else (self.PRIMARY if destaque else self.BG)
+        return tk.Button(
+            parent,
+            text=texto,
+            bg=bg,
+            activebackground=bg,
+            height=2,
+            width=44,
+            command=comando,
+            relief="groove",
+        )
+
+    def _rotulo(self, parent, texto):
+        tk.Label(parent, text=texto, bg=self.BG, fg=self.TEXT).pack(anchor="w", pady=(6, 3))
+
+    def configurarProtecaoTeclado(self):
+        # Não bloqueia o encerramento normal do programa; apenas atalhos usados na atividade.
+        self.janelaPrincipal.bind("<Control-c>", lambda e: "break")
+        self.janelaPrincipal.bind("<Control-q>", lambda e: "break")
+        self.janelaPrincipal.bind("<Escape>", lambda e: "break")
+
     def exibirJanela(self):
         self.janelaPrincipal.mainloop()
 
-    #Responsável por ocultar frames, recebe como parâmetro o seu nome
-    def ocultarFrame(self, nomeFrame):
-        frame = getattr(self, nomeFrame,None)
-        if frame:
-            frame.pack_forget()
-    
-    #Evita interupções (teclado)
-    def configurarProtecaoTeclado(self):
-        # Bloqueia Ctrl+C (KeyInterrupt)
-        self.janelaPrincipal.bind('<Control-c>', lambda e: None)
-        
-        # Bloqueia outros atalhos comuns que podem fechar a janela
-        self.janelaPrincipal.bind('<Control-q>', lambda e: None)  # Ctrl+Q
-        self.janelaPrincipal.bind('<Escape>', lambda e: None)     # Tecla Esc
-        
-#---------------------------------MENU PRINCIPAL---------------------------------  
-    #Frame responsável por exibir o menu principal
     def criarMenuPrincipal(self):
-        #Alguns frames são ocultados durante a exibição do menu principal
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
-        self.ocultarFrame("menuDepositoExpress")
-        self.ocultarFrame("telaPosCadastro")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("menuLoginCliente")
-        self.ocultarFrame("menuAdministrador")
-        self.ocultarFrame("menuCliente")
-        self.ocultarFrame("menuAprovacao")
+        tela = self._nova_tela()
+        self._cabecalho(tela, "BANCO DOS UNIVERSITÁRIOS")
+        tk.Label(
+            tela,
+            text="Soluções pensadas para estudantes",
+            bg=self.BG,
+            fg=self.TEXT,
+            font=("Arial", 10),
+        ).pack(pady=(0, 20))
+        self._botao(tela, "ABERTURA DE CONTA", self.criarMenuAberturaDeConta).pack(pady=8)
+        self._botao(tela, "ACESSAR CONTA", self.criarMenuLogin, destaque=False).pack(pady=8)
+        self._botao(tela, "DEPÓSITO EXPRESS", self.criarMenuDepositoExpress, destaque=False).pack(pady=8)
+        self._botao(tela, "SAIR", self.janelaPrincipal.destroy, danger=True).pack(pady=8)
 
-        #Define o frame do menu principal
-        self.menuPrincipal = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-
-        #Título da página + logo
-        self.logo = tk.PhotoImage(file="ImagemTelaPrincipal.png")
-        self.labelImagem = tk.Label(self.menuPrincipal, image=self.logo,bd=0, highlightthickness=0, pady=5).pack()
-        tk.Label(self.menuPrincipal, text="BANCO DOS UNIVERSITÁRIOS",font=('Arial',12, 'bold'),fg='#223C5E',bg='#E3F2F9').pack(pady=15)
-                
-        #Botões do menu principal
-        Button(self.menuPrincipal, text="ABERTURA DE CONTA", height=3, width=300, command=self.criarMenuAberturaDeConta, bg="#78D1DE").pack(padx=15, pady=10)
-        Button(self.menuPrincipal, text="ACESSAR CONTA",bg='#E3F2F9', height=3, width=300, command= self.criarMenuLogin).pack(padx=15, pady=10)
-        Button(self.menuPrincipal, text="DEPÓSITO EXPRESS", bg='#E3F2F9',height=3, width=300, command=self.criarMenuDepositoExpress).pack(padx=15, pady=10)
-        Button(self.menuPrincipal, text="SAIR",bg='#D26060', height=3, width=300, command=self.janelaPrincipal.destroy).pack(padx=15, pady=10)
-
-        self.menuPrincipal.pack(padx=20, pady=20)
-        
-#---------------------------------TIPO DE LOGIN(ADMIN OU CLIENTE)---------------------------------  
+    # ---------------- LOGIN ----------------
     def criarMenuLogin(self):
-        #Alguns frames são ocultados durante a exibição do menu de login
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("menuLoginCliente")
+        tela = self._nova_tela()
+        self._cabecalho(tela, "ESCOLHA O TIPO DE ACESSO")
+        self._botao(tela, "CLIENTE", self.exibirMenuLoginCliente).pack(pady=8)
+        self._botao(tela, "ADMINISTRADOR", self.exibirMenuLoginAdministrador).pack(pady=8)
+        self._botao(tela, "VOLTAR", self.criarMenuPrincipal, destaque=False).pack(pady=8)
 
-        #Define o frame do menu de login
-        self.menuLogin = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
+    def exibirMenuLoginAdministrador(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "ÁREA DO ADMINISTRADOR")
+        self._rotulo(tela, "Nº de identificação (dica: 000):")
+        self.recebeCodigoIdentificacaoAdm = tk.Entry(tela, show="*")
+        self.recebeCodigoIdentificacaoAdm.pack(fill="x", ipady=8)
+        self._botao(tela, "ACESSAR CONTA", self.validaLoginAdm).pack(pady=18)
+        self._botao(tela, "VOLTAR", self.criarMenuLogin, destaque=False).pack(pady=8)
 
-        #Imagem/Logo da empresa + Título do Frame
-        self.labelImagem = tk.Label(self.menuLogin, image=self.logo,bd=0, highlightthickness=0).pack()
-        tk.Label(self.menuLogin, text="ESCOLHA O TIPO DE ACESSO",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack()
+    def validaLoginAdm(self):
+        codigo = self.recebeCodigoIdentificacaoAdm.get().strip()
+        if not codigo:
+            messagebox.showerror("Erro", "Digite o número de identificação do administrador.")
+            return
+        if codigo == Administrador.getCodigo():
+            self.exibirMenuAdministrador()
+        else:
+            messagebox.showerror("Erro", "Login inválido.")
 
-        #Botões do menu de Login
-        Button(self.menuLogin, text="CLIENTE",bg="#78D1DE", height=3, width=300, command=self.exibirMenuLoginCliente).pack(padx=15, pady=15)
-        Button(self.menuLogin, text="ADMINISTRADOR", height=3, width=300, command=self.exibirMenuLoginAdministrador, bg="#78D1DE").pack(padx=15, pady=15)
-        Button(self.menuLogin, text="VOLTAR AO MENU ANTERIOR", bg='#E3F2F9', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
+    def exibirMenuLoginCliente(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "ÁREA DO CLIENTE")
+        self._rotulo(tela, "Agência:")
+        self.recebeAgenciaCliente = tk.Entry(tela)
+        self.recebeAgenciaCliente.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Número da conta (CCXXXXX-X ou CPXXXXX-X):")
+        self.recebeNumContaCliente = tk.Entry(tela)
+        self.recebeNumContaCliente.pack(fill="x", ipady=8)
+        self._botao(tela, "ACESSAR CONTA", self.validaLoginCliente).pack(pady=18)
+        self._botao(tela, "VOLTAR", self.criarMenuLogin, destaque=False).pack(pady=8)
 
-        self.menuLogin.pack(padx=20, pady=20) 
+    def validaLoginCliente(self):
+        agencia = self.recebeAgenciaCliente.get().strip()
+        numero = self.recebeNumContaCliente.get().strip().upper()
+        if not agencia or not numero:
+            messagebox.showerror("Erro", "Todos os campos devem ser preenchidos.")
+            return
+        if agencia != AGENCIA:
+            messagebox.showerror("Erro", "Agência inválida.")
+            return
 
-#---------------------------------MENU ABERTURA DE CONTA---------------------------------   
+        self.contaLogin = Administrador.verificaSeExisteCadastro(numero, agencia)
+        if self.contaLogin is None:
+            messagebox.showerror("Erro", "Conta não encontrada.")
+            return
+
+        mensagens = Administrador.processarAgendamentos()
+        self.exibirMenuCliente()
+        if mensagens:
+            messagebox.showinfo("Agendamentos", "\n".join(mensagens[:8]))
+
+    # ---------------- ABERTURA DE CONTA ----------------
     def criarMenuAberturaDeConta(self):
-        #Alguns frames são ocultados durante a exibição do menu de abertura de conta
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
+        tela = self._nova_tela()
+        self._cabecalho(tela, "SELECIONE O TIPO DE CONTA")
+        self._botao(tela, "CONTA CORRENTE", lambda: self.criarMenuAberturaDeContaCorrentePoupanca("corrente")).pack(pady=8)
+        self._botao(tela, "CONTA POUPANÇA", lambda: self.criarMenuAberturaDeContaCorrentePoupanca("poupanca")).pack(pady=8)
+        self._botao(tela, "VOLTAR", self.criarMenuPrincipal, destaque=False).pack(pady=8)
 
-        #Define o frame do menu de abertura de conta
-        self.menuAberturaDeConta = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-
-        #Logo + Título do Frame
-        self.labelImagem = tk.Label(self.menuAberturaDeConta, image=self.logo,bd=0, highlightthickness=0).pack()
-        tk.Label(self.menuAberturaDeConta, text="SELECIONE O TIPO DE CONTA",font=('Arial',12, 'bold'),fg='#223C5E', bg='#E3F2F9').pack(pady=10)
-
-        #Botões do menu de abertura de conta
-        Button(self.menuAberturaDeConta, text="CONTA CORRENTE", height=3, width=300, bg="#78D1DE", command= lambda: self.criarMenuAberturaDeContaCorrentePoupanca("corrente")).pack(padx=15, pady=15)
-        Button(self.menuAberturaDeConta, text="CONTA POUPANÇA", bg="#78D1DE", height=3, width=300, command=lambda: self.criarMenuAberturaDeContaCorrentePoupanca("poupanca")).pack(padx=15, pady=15)
-        Button(self.menuAberturaDeConta, text="VOLTAR AO MENU ANTERIOR", bg='#E3F2F9', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-    
-        self.menuAberturaDeConta.pack(padx=20, pady=20)
-
-#---------------------------------ABERTURA DE CONTA CORRENTE / POUPANÇA ---------------------------------   
     def criarMenuAberturaDeContaCorrentePoupanca(self, tipoConta):
-
-        #Alguns frames são ocultados durante a exibição do menu de abertura de conta corrente ou poupança
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("informacoesConta")
-
         self.tipoConta = tipoConta
+        tela = self._nova_tela()
+        self._cabecalho(tela, f"ABERTURA DE CONTA {'CORRENTE' if tipoConta == 'corrente' else 'POUPANÇA'}")
 
-        #Criação do frame
-        self.menuAberturaDeContaCorrentePoupanca = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-        self.menuAberturaDeContaCorrentePoupanca.pack(padx=20, pady=20)
+        self._rotulo(tela, "Nome completo:")
+        self.recebeNomeCompleto = tk.Entry(tela)
+        self.recebeNomeCompleto.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Endereço:")
+        self.recebeEndereco = tk.Entry(tela)
+        self.recebeEndereco.pack(fill="x", ipady=8)
+        self._rotulo(tela, "CPF:")
+        self.recebeCPF = tk.Entry(tela)
+        self.recebeCPF.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Senha numérica (6 dígitos):")
+        self.recebeSenha = tk.Entry(tela, show="*")
+        self.recebeSenha.pack(fill="x", ipady=8)
 
-        tk.Label(self.menuAberturaDeContaCorrentePoupanca, text="ABERTURA DE CONTA",font=('Arial',12, 'bold'),fg='#223C5E', bg='#E3F2F9').pack()
+        self._botao(tela, "CRIAR CONTA", self.funcaoCriarContaCorrentePoupanca).pack(pady=18)
+        self._botao(tela, "VOLTAR", self.criarMenuAberturaDeConta, destaque=False).pack(pady=8)
 
-        #Nome
-        tk.Label(self.menuAberturaDeContaCorrentePoupanca,text="Nome completo:",bg="#E3F2F9", justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeNomeCompleto = tk.Entry(self.menuAberturaDeContaCorrentePoupanca, width=300)
-        self.recebeNomeCompleto.pack(ipady=10, padx=15)
-
-        #Endereço
-        tk.Label(self.menuAberturaDeContaCorrentePoupanca,text="Endereço:",bg="#E3F2F9", justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeEndereco = tk.Entry(self.menuAberturaDeContaCorrentePoupanca, width=300)
-        self.recebeEndereco.pack(ipady=10, padx=15)
-
-        #CPF:
-        tk.Label(self.menuAberturaDeContaCorrentePoupanca,text="CPF:",bg="#E3F2F9", justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeCPF = tk.Entry(self.menuAberturaDeContaCorrentePoupanca, width=300)
-        self.recebeCPF.pack(ipady=10, padx=15)
-
-        #Senha
-        tk.Label(self.menuAberturaDeContaCorrentePoupanca,text="Senha numérica (6 dígitos):",bg="#E3F2F9", justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeSenha = tk.Entry(self.menuAberturaDeContaCorrentePoupanca, width=300)
-        self.recebeSenha.pack(ipady=10, padx=15)
-
-        #Botões do menu de criação de contas
-        Button(self.menuAberturaDeContaCorrentePoupanca, text="CRIAR CONTA", height=3, width=300, bg="#78D1DE", command= self.funcaoCriarContaCorrentePoupanca).pack(padx=15, pady=15)
-        Button(self.menuAberturaDeContaCorrentePoupanca, text="VOLTAR AO MENU ANTERIOR", bg='#E3F2F9', height=3, width=300, command=self.criarMenuAberturaDeConta).pack(padx=15, pady=15)
-    
     def funcaoCriarContaCorrentePoupanca(self):
-        # Pega valores dos campos de entrada
         nome = self.recebeNomeCompleto.get().strip()
         endereco = self.recebeEndereco.get().strip()
         cpf = self.recebeCPF.get().strip()
         senha = self.recebeSenha.get().strip()
-        
-        # Verifica se todos os campos foram preenchidos
         if not all([nome, endereco, cpf, senha]):
             messagebox.showerror("Erro", "Todos os campos devem ser preenchidos.")
             return
-
         try:
-
-            if hasattr(self, 'tipoConta') and self.tipoConta == "corrente":
+            if self.tipoConta == "corrente":
                 self.contaLogin = ContaCorrente(nome, endereco, cpf, senha)
             else:
                 self.contaLogin = ContaPoupanca(nome, endereco, cpf, senha)
             self.exibirTelaPosCadastro()
-        except ValueError as e:
-            messagebox.showerror("Erro", str(e))
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
 
-#------------------------------TELA PÓS CADASTRO---------------------------------------------
     def exibirTelaPosCadastro(self):
-            self.ocultarFrame("menuPrincipal")
-            self.ocultarFrame("menuAberturaDeConta")
-            self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
+        tela = self._nova_tela()
+        self._cabecalho(tela, "CONTA CADASTRADA COM SUCESSO!")
+        tk.Label(
+            tela,
+            text=(
+                f"{self.contaLogin.titularConta.upper()}, é um prazer ter você com a gente.\n"
+                "Utilize os dados abaixo para acessar sua conta."
+            ),
+            bg=self.BG,
+            fg=self.TEXT,
+            justify="center",
+            wraplength=450,
+        ).pack(pady=10)
+        for rotulo, valor in (("AGÊNCIA", self.contaLogin.numeroAgencia), ("NÚMERO DA CONTA", self.contaLogin.numeroConta)):
+            self._rotulo(tela, rotulo)
+            campo = tk.Entry(tela, state="normal")
+            campo.insert(0, valor)
+            campo.config(state="readonly")
+            campo.pack(fill="x", ipady=7)
+        self._botao(tela, "VOLTAR AO MENU PRINCIPAL", self.criarMenuPrincipal).pack(pady=25)
 
-            self.telaPosCadastro = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-
-            tk.Label(self.telaPosCadastro, text="CONTA CADASTRADA COM SUCESSO!",font=('Arial',12, 'bold'), bg='#E3F2F9',width=380).pack(pady=(30,10))
-            self.labelImagem = tk.Label(self.telaPosCadastro, image=self.logo,bd=0, highlightthickness=0, pady=5).pack()
-            tk.Label(self.telaPosCadastro, text=f"{self.contaLogin.titularConta.upper()}, é um prazer ter você com a gente.\nEstamos aqui para apoiar sua jornada com soluções pensadas\nespecialmente para estudantes como você.", bg='#E3F2F9').pack(padx=30, pady=15)
-           
-            # AGÊNCIA (selecionável)
-            tk.Label(self.telaPosCadastro, text="AGÊNCIA:", bg='#E3F2F9', font=('Arial',10, 'bold')).pack(padx=15, pady=(15, 0), anchor='w')
-
-            agencia = tk.Text(self.telaPosCadastro, height=1, font=('Arial',10), bg='white', bd=1, padx=5, pady=3)
-            agencia.insert(tk.END, self.contaLogin.numeroAgencia)
-            agencia.config(state='disabled')
-            agencia.pack(padx=15, fill='x')
-
-            # NÚMERO DA CONTA (selecionável)
-            tk.Label(self.telaPosCadastro, text="NÚMERO DA CONTA:", bg='#E3F2F9', font=('Arial',10, 'bold')).pack(padx=15, pady=(15, 0), anchor='w')
-
-            conta = tk.Text(self.telaPosCadastro, height=1, font=('Arial',10), bg='white', bd=1, padx=5, pady=3)
-            conta.insert(tk.END, self.contaLogin.numeroConta)
-            conta.config(state='disabled')
-            conta.pack(padx=15, fill='x', pady=(0, 15))
-            
-            tk.Label(self.telaPosCadastro, text="Utilize as informações acima para realizar login.", bg='#E3F2F9',width=380).pack(pady=(15,20))
-            tk.Button(self.telaPosCadastro, text="VOLTAR AO MENU PRINCIPAL",bg="#78D1DE", height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=(15,20))
-
-            self.telaPosCadastro.pack()
-
-#-------------------------------TELA LOGIN ADMINISTRADOR------------------------------------
-    def exibirMenuLoginAdministrador(self):
-        #Alguns frames são ocultados durante a exibição do menu de login
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuAprovacao")
-
-        #Criação do Frame
-        self.menuLoginAdministrador = tk.Frame(self.janelaPrincipal,bg='#E3F2F9', height=600, width=380)
-        
-        self.labelImagem = tk.Label(self.menuLoginAdministrador, image=self.logo,bd=0, highlightthickness=0).pack()
-        tk.Label(self.menuLoginAdministrador,text="ÁREA DO ADMINISTRADOR",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(20,20))
-
-        #Credencial para acesso do Administrador
-        tk.Label(self.menuLoginAdministrador,text="N° de identificação (dica: 000): ",bg='#E3F2F9',justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeCodigoIdentificacaoAdm = tk.Entry(self.menuLoginAdministrador, width=300)
-        self.recebeCodigoIdentificacaoAdm.pack(ipady=10, padx=15)
-
-        #Botões do Frame
-        tk.Button(self.menuLoginAdministrador, text="ACESSAR CONTA", height=3, width=300, bg="#78D1DE", command=self.validaLoginAdm).pack(padx=15, pady=15)
-        tk.Button(self.menuLoginAdministrador, text="SAIR", bg='#D26060', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-
-        self.menuLoginAdministrador.pack()
-
-#-------------------------------TELA PRINCIPAL ADMINISTRADOR------------------------------------
+    # ---------------- ADMIN ----------------
     def exibirMenuAdministrador(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("gerenciamentoDeContasAdministrador")
-        self.ocultarFrame("informacoesContaAdministrador")
-        self.ocultarFrame("menuAprovacao")
-        
-        self.menuAdministrador = tk.Frame(self.janelaPrincipal,bg='#E3F2F9', height=600, width=380)
+        tela = self._nova_tela()
+        self._cabecalho(tela, "BEM-VINDO, ADMINISTRADOR")
+        self._botao(tela, "EXIBIR SOLICITAÇÕES", self.criarMenuAprovacaoExclusao).pack(pady=8)
+        self._botao(tela, "GERENCIAMENTO DE CONTAS", self.exibirGerenciamentoDeConntasAdministrador).pack(pady=8)
+        self._botao(tela, "VOLTAR AO MENU PRINCIPAL", self.criarMenuPrincipal, destaque=False).pack(pady=8)
 
-        tk.Label(self.menuAdministrador,text="Bem-vindo, ADMINISTRADOR",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(50,50))
-
-        tk.Button(self.menuAdministrador, text="EXIBIR SOLICITAÇÕES", bg="#78D1DE", height=3, width=300, command=self.criarMenuAprovacaoExclusao).pack(padx=15, pady=15) #Gerencia solicitação de exclusão
-        tk.Button(self.menuAdministrador, text="GERENCIAMENTO DE CONTAS", bg="#78D1DE", height=3, width=300, command=self.exibirGerenciamentoDeConntasAdministrador).pack(padx=15, pady=15) #Exibe informações sobre as contas selecionadas
-        tk.Button(self.menuAdministrador, text="VOLTAR AO MENU PRINCIPAL", bg='#E3F2F9', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-
-        self.menuAdministrador.pack()       
-
-
-    def validaLoginAdm(self):
-        if not self.recebeCodigoIdentificacaoAdm.get(): #Indiica que o campo é obrigatório
-            messagebox.showerror("Erro","Digite número de identificação do Administrador.")
-            return False
-        if self.recebeCodigoIdentificacaoAdm.get() == Administrador.getCodigo():
-            self.exibirMenuAdministrador()
-        else:
-            messagebox.showerror("Erro","Login inválido!")
-
-#-------------------------------GERENCIA SOLICITAÇÕES DE EXCLUSÃO------------------------------------
     def criarMenuAprovacaoExclusao(self):
-        if hasattr(self, 'menuAprovacao'):
-            self.menuAprovacao.destroy()
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("menuAdministrador")
-        self.ocultarFrame("informacoesContaAdministrador")
-        self.ocultarFrame("menuExclusaoConta")
-        self.ocultarFrame("menuAprovação")
-        
-        self.menuAprovacao = tk.Frame(self.janelaPrincipal, bg='#E3F2F9')
-        self.menuAprovacao.pack(fill='both', expand=True)
-        
-        self.padronizarLabels(self.janelaPrincipal)
-
-        # Título
-        tk.Label(self.menuAprovacao, text="SOLICITAÇÕES DE EXCLUSÃO", font=('Arial',12, 'bold'), bg='#E3F2F9').pack(pady=20)
-        
-        # Lista de solicitações
-        frameLista = tk.Frame(self.menuAprovacao, bg='#E3F2F9')
-        frameLista.pack(fill='x', padx=20)
-        
+        tela = self._nova_tela()
+        self._cabecalho(tela, "SOLICITAÇÕES DE EXCLUSÃO")
         solicitacoes = Administrador.listarSolicitacoes()
-        if not solicitacoes:
-            tk.Label(frameLista, text="Nenhuma solicitação pendente", bg='#E3F2F9').pack()
+        if solicitacoes:
+            for item in solicitacoes:
+                tk.Label(tela, text=item, bg=self.BG, fg=self.TEXT, justify="left", wraplength=470).pack(anchor="w", pady=4)
         else:
-            for solic in solicitacoes:
-                tk.Label(frameLista, text=solic, anchor='w', bg='#E3F2F9').pack(fill='x', pady=5)
-        
-        # Controles de aprovação
-        frameControles = tk.Frame(self.menuAprovacao, bg='#E3F2F9')
-        frameControles.pack(pady=20)
+            tk.Label(tela, text="Nenhuma solicitação pendente.", bg=self.BG, fg=self.TEXT).pack(pady=20)
 
-        # Frame para Label + Entry
-        frameId = tk.Frame(frameControles, bg='#E3F2F9')
-        frameId.pack()
+        self._rotulo(tela, "ID da solicitação:")
+        self.entryIdSolicitacao = tk.Entry(tela)
+        self.entryIdSolicitacao.pack(fill="x", ipady=8)
+        frame = tk.Frame(tela, bg=self.BG)
+        frame.pack(fill="x", pady=18)
+        self._botao(frame, "APROVAR", lambda: self.processarAprovacao(True)).pack(side="left", expand=True, fill="x", padx=4)
+        self._botao(frame, "REJEITAR", lambda: self.processarAprovacao(False), danger=True).pack(side="left", expand=True, fill="x", padx=4)
+        self._botao(tela, "VOLTAR", self.exibirMenuAdministrador, destaque=False).pack(pady=8)
 
-        tk.Label(frameId, text="ID da solicitação:", bg='#E3F2F9').pack(side='left')
-        self.entryIdSolicitacao = tk.Entry(frameId, width=10)
-        self.entryIdSolicitacao.pack(side='left', padx=5, pady=10,ipady=6)
-
-        # Frame para os botões Aprovar/Rejeitar
-        frameBotoes = tk.Frame(frameControles, bg='#E3F2F9')
-        frameBotoes.pack()
-
-        tk.Button(frameBotoes, text="APROVAR", bg="#78D1DE", width=300, height=3, command=lambda: self.processarAprovacao(True)).pack(padx=15,pady=15)
-        tk.Button(frameBotoes, text="REJEITAR",bg='#D26060', width=300, height=3, command=lambda: self.processarAprovacao(False)).pack(padx=15,pady=15)
-        tk.Button(self.menuAprovacao, text="VOLTAR", bg='#E3F2F9', width=300,  height=3, command=self.exibirMenuAdministrador).pack(padx=15,pady=15)
-
-    def processarAprovacao(self, aprovar):
+    def processarAprovacao(self, aprovar: bool):
         try:
-            idSolicitacao = int(self.entryIdSolicitacao.get())
-            if aprovar:
-                resultado = Administrador.aprovarExclusao(idSolicitacao)
-                messagebox.showinfo("Sucesso", resultado)
-            else:
-                resultado = Administrador.rejeitarExclusao(idSolicitacao)
-                messagebox.showinfo("Sucesso", resultado)
-            
-            self.criarMenuAprovacaoExclusao()  # Atualiza a lista
+            identificacao = int(self.entryIdSolicitacao.get().strip())
+            resultado = Administrador.aprovarExclusao(identificacao) if aprovar else Administrador.rejeitarExclusao(identificacao)
+            messagebox.showinfo("Sucesso", resultado)
+            self.criarMenuAprovacaoExclusao()
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
 
-        except ValueError:
-            messagebox.showerror("Erro", "ID da solicitação inválido! Por favor, digite apenas números.")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Ocorreu um erro inesperado: {str(e)}")
-
-#-------------------------------TELA GERENCIAMENTO DE CONTAS - ADMINISTRADOR------------------------------------
     def exibirGerenciamentoDeConntasAdministrador(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("menuAdministrador")
-        self.ocultarFrame("informacoesContaAdministrador")
-        
-        self.gerenciamentoDeContasAdministrador = tk.Frame(self.janelaPrincipal,bg='#E3F2F9', height=600, width=380)
-        self.gerenciamentoDeContasAdministrador.pack()       
-        tk.Label(self.gerenciamentoDeContasAdministrador,text="GERENCIAMENTO DE CONTAS",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(50,50))
-        tk.Label(self.gerenciamentoDeContasAdministrador, text="Número da agência:", width=300, justify="left",anchor="w",bg='#E3F2F9').pack(anchor="w",padx=15, pady=15)
-        self.agenciaPesquisaAdm = tk.Entry(self.gerenciamentoDeContasAdministrador,width=300)
-        self.agenciaPesquisaAdm.pack(ipady=10, padx=15)
-        tk.Label(self.gerenciamentoDeContasAdministrador, text="Número da conta:", width=300, justify="left",anchor="w",bg='#E3F2F9').pack(anchor="w",padx=15, pady=15)
-        self.contaPesquisaAdm = tk.Entry(self.gerenciamentoDeContasAdministrador,width=300)
-        self.contaPesquisaAdm.pack(ipady=10, padx=15)
-        tk.Button(self.gerenciamentoDeContasAdministrador, text="EXIBIR DETALHES", bg="#78D1DE", height=3, width=300, command=self.recebeContaParaAnalise).pack(padx=15, pady=(50,15))
-        tk.Button(self.gerenciamentoDeContasAdministrador, text="VOLTAR AO MENU ANTERIOR",bg='#E3F2F9', height=3, width=300, command=self.exibirMenuAdministrador).pack(padx=15, pady=(50,15))
+        tela = self._nova_tela()
+        self._cabecalho(tela, "GERENCIAMENTO DE CONTAS")
+        self._rotulo(tela, "Número da agência:")
+        self.agenciaPesquisaAdm = tk.Entry(tela)
+        self.agenciaPesquisaAdm.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Número da conta:")
+        self.contaPesquisaAdm = tk.Entry(tela)
+        self.contaPesquisaAdm.pack(fill="x", ipady=8)
+        self._botao(tela, "EXIBIR DETALHES", self.recebeContaParaAnalise).pack(pady=20)
+        self._botao(tela, "VOLTAR", self.exibirMenuAdministrador, destaque=False).pack(pady=8)
 
     def recebeContaParaAnalise(self):
         agencia = self.agenciaPesquisaAdm.get().strip()
-        numeroC = self.contaPesquisaAdm.get().strip()
-
-        self.contaLogin = Administrador.verificaSeExisteCadastro(numeroC,agencia)
-        if self.contaLogin is not None:
-            self.exibirInformacoesContaAdministrador()
-        else:
-            messagebox.showerror("Erro","Conta não encontrada.")
-
-#------------------------------INFORMAÇÕES DA CONTA -> Administrador----------------------------------------
-    def exibirInformacoesContaAdministrador(self): 
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginAdministrador")
-        self.ocultarFrame("menuAdministrador")
-        self.ocultarFrame("gerenciamentoDeContasAdministrador")
-        
-        self.informacoesContaAdministrador = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-        tk.Label(self.informacoesContaAdministrador, text="DADOS DO CLIENTE:", bg='#E3F2F9',width=380,font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(50,10))
-        tk.Label(self.informacoesContaAdministrador, text = f"Tipo de conta: {self.contaLogin.tipoContaCriada}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaAdministrador, text=f"Agência: {self.contaLogin.numeroAgencia}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaAdministrador, text=f"Número da conta: {self.contaLogin.numeroConta}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaAdministrador, text=f"Titular: {self.contaLogin.titularConta}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaAdministrador, text=f"Endereço: {self.contaLogin.enderecoTitular}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaAdministrador, text=f"Senha: {self.contaLogin.senha}", bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Button(self.informacoesContaAdministrador, text="VOLTAR MENU ANTERIOR",bg='#D26060', height=3, width=300, command=self.exibirGerenciamentoDeConntasAdministrador).pack(padx=15, pady=(30,50))
-        # self.atualizarLabelsEndereco()
-        self.informacoesContaAdministrador.pack()
-
-#-------------------------------TELA LOGIN CLIENTE------------------------------------
-    def exibirMenuLoginCliente(self):
-        #Alguns frames são ocultados durante a exibição do menu de login do cliente
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuExtrato")
-
-        #Define o frame do menu de abertura de conta
-        self.menuLoginCliente = tk.Frame(self.janelaPrincipal,bg='#E3F2F9', height=600, width=380)
-
-        #Logo + título do frame
-        self.labelImagem = tk.Label(self.menuLoginCliente, image=self.logo,bd=0, highlightthickness=0).pack()
-        tk.Label(self.menuLoginCliente,text="ÁREA DO CLIENTE",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(20,20))
-        
-        #Recebe o número da agência digitada pelo usuário
-        tk.Label(self.menuLoginCliente,text="Agência (dica -> ver CLI):",bg='#E3F2F9',justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeAgenciaCliente = tk.Entry(self.menuLoginCliente, width=300)
-        self.recebeAgenciaCliente.pack(ipady=10, padx=15)
-        
-        #Recebe o número da conta digitado
-        tk.Label(self.menuLoginCliente,text="N° da conta: (CPXXXXX-X ou CCXXXXX-X):" ,bg='#E3F2F9',justify="left").pack(padx=15, pady=10, anchor="w")
-        self.recebeNumContaCliente = tk.Entry(self.menuLoginCliente, width=300)
-        self.recebeNumContaCliente.pack(ipady=10, padx=15)
-
-        #Botões de Login/Sair da página
-        tk.Button(self.menuLoginCliente, text="ACESSAR CONTA", height=3, width=300, bg="#78D1DE", command=self.validaLoginCliente).pack(padx=15, pady=15)
-        tk.Button(self.menuLoginCliente, text="SAIR", bg='#D26060', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-
-
-        self.menuLoginCliente.pack()
-
-
-#-------------------------------TELA MENU PRINCIPAL CLIENTE------------------------------------
-    def exibirMenuCliente(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginCliente")
-        self.ocultarFrame("informacoesConta")
-        self.ocultarFrame("trasacoesBancarias")
-        self.ocultarFrame("informacoesContaCliente")
-        self.ocultarFrame("menuAlteracaoEndereco")
-        self.ocultarFrame("telaExclusaoConta")       
-        self.ocultarFrame("menuExtrato")
-        self.ocultarFrame("menuCliente")
-        self.ocultarFrame("menuSaque")
-        self.ocultarFrame("menuTransferir")
-        self.ocultarFrame("menuDepositoLogado")
-
-
-
-        self.menuCliente = tk.Frame(self.janelaPrincipal,bg='#E3F2F9', height=600, width=380)
-        self.menuCliente.pack()       
-        tk.Label(self.menuCliente,text=f"Bem-vindo(a), {self.contaLogin.titularConta.upper()}",bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(30,20))
-        saldoDisplay = tk.Frame(self.menuCliente, bg='white', padx=20, pady=10, highlightbackground="#DDD", highlightthickness=1)
-        saldoDisplay.pack(padx=10)
-        tk.Label(saldoDisplay, text=f"R$ {self.contaLogin.saldoAtual:.2f}", bg='white', font=('Arial', 12, 'bold'), fg='#223C5E').pack()
-        tk.Button(self.menuCliente, text="REALIZAR TRANSAÇÃO", bg="#78D1DE", height=3, width=300, command=self.exibirTransacoesBancarias).pack(padx=15, pady=15)
-        tk.Button(self.menuCliente, text="ALTERAR ENDEREÇO", bg="#78D1DE", height=3, width=300, command=self.criaMenuAlteracaoEndereco).pack(padx=15, pady=15)
-        tk.Button(self.menuCliente, text="INFORMAÇÕES DA CONTA", bg="#78D1DE", height=3, width=300, command=self.exibirInformacoesContaCliente).pack(padx=15, pady=15)
-        tk.Button(self.menuCliente, text="EXCLUSÃO DA CONTA",bg='#E3F2F9', height=3, width=300, command=self.criaMenuExclusaoConta).pack(padx=15, pady=15)
-        tk.Button(self.menuCliente, text="VOLTAR AO MENU PRINCIPAL", bg='#E3F2F9', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-
-    def validaLoginCliente(self):
-
-        agenciaParametro = self.recebeAgenciaCliente.get().strip()
-        contaParametro = self.recebeNumContaCliente.get().strip().upper()
-
-        if not all([agenciaParametro, contaParametro]):
-            messagebox.showerror("Erro","Todos os campos devem ser preenchidos.")
-            return False
-        
-        self.contaLogin =  Administrador.verificaSeExisteCadastro(contaParametro,agenciaParametro)
-        if self.contaLogin is not None:
-            self.exibirMenuCliente()
-        
-#-------------------------------VER TRANSAÇÕES BANCÁRIAS------------------------------------
-    def exibirTransacoesBancarias(self, refresh=False):
-    # Oculta todos os frames relevantes
-        frames_para_ocultar = [
-            "menuPrincipal", "menuLogin", "menuLoginCliente",
-            "informacoesConta", "menuCliente", "menuDepositoLogado",
-            "menuSaque", "menuExtrato", "menuTransferir"
-        ]
-        
-        for frame in frames_para_ocultar:
-            self.ocultarFrame(frame)
-        
-        # Destrói o frame antigo se for um refresh
-        if refresh and hasattr(self, 'trasacoesBancarias'):
-            self.trasacoesBancarias.destroy()
-        
-        # Cria um NOVO frame
-        self.trasacoesBancarias = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        self.trasacoesBancarias.pack()
-        
-        tk.Label(self.trasacoesBancarias, text="TRANSAÇÕES DISPONÍVEIS", 
-                bg='#E3F2F9', font=('Arial',12, 'bold'), fg='#223C5E').pack(pady=(50,50))
-        
-        # Botões com verificação de estado
-        botoes = [
-            ("EXIBIR EXTRATO", self.criarMenuExtrato),
-            ("TRANSFERIR", self.criarMenuTransferir),
-            ("DEPOSITAR", self.criarMenuDepositoLogado),
-            ("SACAR", self.criarMenuSaque),
-            ("VOLTAR", self.exibirMenuCliente)
-        ]
-        
-        for texto, comando in botoes:
-            btn = tk.Button(self.trasacoesBancarias, text=texto, 
-                        bg="#78D1DE" if texto != "VOLTAR" else '#E3F2F9',
-                        height=3, width=300, command=comando)
-            btn.pack(padx=15, pady=15)
-            
-            # Desativa botões se saldo for negativo (opcional)
-            if texto in ["TRANSFERIR", "SACAR"] and self.contaLogin.saldoAtual < 0:
-                btn.config(state='disabled', bg='#CCCCCC')
-
-#------------------------------INFORMAÇÕES DA CONTA -> Cliente----------------------------------------
-    def exibirInformacoesContaCliente(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
-        self.ocultarFrame("menuCliente")
-        self.ocultarFrame("menuAlteracaoEndereco")
-
-        self.informacoesContaCliente = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-        self.informacoesContaCliente.pack()
-        tk.Label(self.informacoesContaCliente, text="MEUS DADOS:", bg='#E3F2F9',width=380,font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(50,10))
-        tk.Label(self.informacoesContaCliente, text = "Tipo de conta: "+self.contaLogin.tipoContaCriada, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaCliente, text="Agência: "+self.contaLogin.numeroAgencia, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaCliente, text="Número da conta: "+self.contaLogin.numeroConta, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaCliente, text="Titular: "+self.contaLogin.titularConta, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaCliente, text="Endereço: "+self.contaLogin.enderecoTitular, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Label(self.informacoesContaCliente, text="Senha: "+self.contaLogin.senha, bg='#E3F2F9').pack(anchor="w",padx=30, pady=5)
-        tk.Button(self.informacoesContaCliente, text="VOLTAR AO MENU DA CONTA", bg="#78D1DE", height=3, width=300, command=self.exibirMenuCliente).pack(padx=15, pady=(30,50))
-    
-#-------------------------------TELA ALTERAÇÃO DE ENDEREÇO------------------------------------
-    def criaMenuAlteracaoEndereco(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
-        self.ocultarFrame("menuCliente")
-        
-        self.menuAlteracaoEndereco = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        self.menuAlteracaoEndereco.pack()       
-        
-        # Componentes da interface
-        tk.Label(self.menuAlteracaoEndereco, text="ALTERAR ENDEREÇO", bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(50,20))
-        tk.Label(self.menuAlteracaoEndereco, text="A alteração será refletida em todas as suas contas.", width=300, bg='#E3F2F9', wraplength=350).pack(padx=15, pady=15)
-        tk.Label(self.menuAlteracaoEndereco, text="Novo endereço completo:", width=300, justify="left", anchor="w", bg='#E3F2F9').pack(anchor="w", padx=15, pady=5)
-        self.entryNovoEndereco = tk.Entry(self.menuAlteracaoEndereco, width=300)
-        self.entryNovoEndereco.pack(ipady=10, padx=15, pady=(0,15))
-        tk.Button(self.menuAlteracaoEndereco, text="CONFIRMAR ALTERAÇÃO", bg="#78D1DE", height=3, width=300, command=self.processarAlteracaoEndereco).pack(padx=15, pady=(30,15))
-        tk.Button(self.menuAlteracaoEndereco, text="VOLTAR AO MENU", bg='#E3F2F9', height=3, width=300, command=self.exibirMenuCliente).pack(padx=15, pady=15)
-    
-    def processarAlteracaoEndereco(self):
-        novoEndereco = self.entryNovoEndereco.get().strip()
-        
-        if not novoEndereco:
-            messagebox.showerror("Erro", "Por favor, informe o novo endereço!")
+        numero = self.contaPesquisaAdm.get().strip().upper()
+        conta = Administrador.verificaSeExisteCadastro(numero, agencia)
+        if conta is None:
+            messagebox.showerror("Erro", "Conta não encontrada.")
             return
-        
+        self.contaLogin = conta
+        self.exibirInformacoesContaAdministrador()
+
+    def exibirInformacoesContaAdministrador(self):
+        conta = self.contaLogin
+        tela = self._nova_tela()
+        self._cabecalho(tela, "DADOS DO CLIENTE")
+        dados = [
+            ("Tipo de conta", conta.tipoContaCriada),
+            ("Agência", conta.numeroAgencia),
+            ("Número da conta", conta.numeroConta),
+            ("Titular", conta.titularConta),
+            ("Endereço", conta.enderecoTitular),
+            ("Saldo", f"R$ {conta.saldoAtual:.2f}"),
+        ]
+        if isinstance(conta, ContaCorrente):
+            dados.append(("Cheque especial disponível", f"R$ {conta.limiteChequeEspecial:.2f}"))
+        for chave, valor in dados:
+            tk.Label(tela, text=f"{chave}: {valor}", bg=self.BG, fg=self.TEXT).pack(anchor="w", pady=5)
+        self._botao(tela, "VOLTAR", self.exibirGerenciamentoDeConntasAdministrador, destaque=False).pack(pady=25)
+
+    # ---------------- CLIENTE ----------------
+    def exibirMenuCliente(self):
+        Administrador.processarAgendamentos()
+        tela = self._nova_tela()
+        self._cabecalho(tela, f"BEM-VINDO(A), {self.contaLogin.titularConta.upper()}")
+        saldo = tk.Frame(tela, bg="white", bd=1, relief="solid", padx=20, pady=12)
+        saldo.pack(fill="x", pady=(0, 15))
+        tk.Label(saldo, text=f"R$ {self.contaLogin.saldoAtual:.2f}", bg="white", fg=self.TEXT, font=("Arial", 13, "bold")).pack()
+        if isinstance(self.contaLogin, ContaCorrente):
+            tk.Label(saldo, text=f"Cheque especial disponível: R$ {self.contaLogin.limiteChequeEspecial:.2f}", bg="white", fg=self.TEXT).pack()
+
+        self._botao(tela, "REALIZAR TRANSAÇÃO", self.exibirTransacoesBancarias).pack(pady=5)
+        self._botao(tela, "ALTERAR ENDEREÇO", self.criaMenuAlteracaoEndereco).pack(pady=5)
+        self._botao(tela, "INFORMAÇÕES DA CONTA", self.exibirInformacoesContaCliente).pack(pady=5)
+        self._botao(tela, "EXCLUSÃO DA CONTA", self.criaMenuExclusaoConta, destaque=False).pack(pady=5)
+        self._botao(tela, "VOLTAR AO MENU PRINCIPAL", self.criarMenuPrincipal, destaque=False).pack(pady=5)
+
+    def exibirInformacoesContaCliente(self):
+        conta = self.contaLogin
+        tela = self._nova_tela()
+        self._cabecalho(tela, "MEUS DADOS")
+        dados = [
+            ("Tipo de conta", conta.tipoContaCriada),
+            ("Agência", conta.numeroAgencia),
+            ("Número da conta", conta.numeroConta),
+            ("Titular", conta.titularConta),
+            ("Endereço", conta.enderecoTitular),
+            ("Senha", "******"),
+        ]
+        for chave, valor in dados:
+            tk.Label(tela, text=f"{chave}: {valor}", bg=self.BG, fg=self.TEXT).pack(anchor="w", pady=5)
+        self._botao(tela, "VOLTAR", self.exibirMenuCliente).pack(pady=25)
+
+    # ---------------- TRANSAÇÕES ----------------
+    def exibirTransacoesBancarias(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "TRANSAÇÕES DISPONÍVEIS")
+        self._botao(tela, "EXIBIR EXTRATO", self.criarMenuExtrato).pack(pady=6)
+        self._botao(tela, "TRANSFERIR", self.criarMenuTransferir).pack(pady=6)
+        self._botao(tela, "DEPOSITAR", self.criarMenuDepositoLogado).pack(pady=6)
+        self._botao(tela, "SACAR", self.criarMenuSaque).pack(pady=6)
+        self._botao(tela, "VOLTAR", self.exibirMenuCliente, destaque=False).pack(pady=6)
+
+    def criarMenuDepositoLogado(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "DEPÓSITO")
+        self._rotulo(tela, "Valor do depósito:")
+        self.recebeValorDepositoLogado = tk.Entry(tela)
+        self.recebeValorDepositoLogado.pack(fill="x", ipady=8)
+        self._botao(tela, "DEPOSITAR HOJE", lambda: self.processarDeposito("hoje")).pack(pady=12)
+        self._botao(tela, "PROGRAMAR DEPÓSITO", lambda: self.processarDeposito("programar"), destaque=False).pack(pady=8)
+        self._botao(tela, "CANCELAR", self.exibirTransacoesBancarias, danger=True).pack(pady=8)
+
+    def processarDeposito(self, tipoDeposito: str):
+        valor_texto = self.recebeValorDepositoLogado.get().strip().replace(",", ".")
         try:
-            contasAlteradas = Administrador.alterarEnderecoPorNome(
-                self.contaLogin.titularConta,novoEndereco,self.contaLogin.cpf)
-            
-            if contasAlteradas > 0:
-                # Atualiza o objeto local imediatamente
-                self.contaLogin.enderecoTitular = novoEndereco
-                
-                # Força atualização da UI
-                self.exibirInformacoesContaCliente()
-                
-                messagebox.showinfo("Sucesso", 
-                                f"Endereço atualizado em {contasAlteradas} conta(s)!\n"
-                                f"Novo endereço: {novoEndereco}")
-            else:
-                messagebox.showerror("Erro", "Nenhuma conta encontrada para alteração!")
-                
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha na alteração:\n{str(e)}")
+            valor = float(valor_texto)
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erro", "Digite um valor numérico positivo.")
+            return
 
-#-------------------------------EXCLUSÃO DE CONTA------------------------------------
-    def criaMenuExclusaoConta(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
-        self.ocultarFrame("menuCliente")
-
-        self.telaExclusaoConta = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        self.telaExclusaoConta.pack()       
-        
-        # Componentes da interface
-        tk.Label(self.telaExclusaoConta, text="EXCLUSÃO DA CONTA", bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(30,20))
-        
-        # Status da solicitação (agora com mais informações)
-        self.labelStatus = tk.Label(self.telaExclusaoConta, text="", bg='#E3F2F9', fg='#333333', wraplength=350)
-        self.labelStatus.pack(pady=10)
-        
-        tk.Label(self.telaExclusaoConta, text="Solicitações podem ser canceladas até a aprovação do administrador.", width=300, bg='#E3F2F9', wraplength=350).pack(padx=15, pady=15)
-        
-        # Frame para botões principais
-        frameBotoes = tk.Frame(self.telaExclusaoConta, bg='#E3F2F9')
-        frameBotoes.pack(pady=10)
-        
-        self.btnConfirmar = tk.Button(frameBotoes, text="SOLICITAR EXCLUSÃO", height=3, width=300,command=self.confirmarExclusaoConta, bg='#FF6B6B')
-        self.btnConfirmar.pack(padx=15, pady=15)
-        self.btnCancelar = tk.Button(frameBotoes, text="CANCELAR SOLICITAÇÃO", height=3, width=300,command=self.cancelarExclusaoConta, bg="#78D1DE", state='disabled')
-        self.btnCancelar.pack(padx=15,pady=15)
-        tk.Button(self.telaExclusaoConta, text="VOLTAR",bg='#E3F2F9', height=3, width=300,command=self.exibirMenuCliente).pack(pady=10)
-        
-        self.atualizarStatusExclusao()
-
-    #Auxilia no processo de exclusão atualizando o status
-    def atualizarStatusExclusao(self):
-        if hasattr(self.contaLogin, 'solicitacaoExclusao'):
-            status = Administrador.verificarStatusExclusao(self.contaLogin.numeroConta)
-            self.labelStatus.config(text=f"Status: {status}\nEnviada em: {self.contaLogin.solicitacaoExclusao['data']}", fg='#006600')
-            self.btnConfirmar.config(state='disabled')
-            self.btnCancelar.config(state='normal')
+        if tipoDeposito == "hoje":
+            data = date.today()
+            Conta.depositar(self.contaLogin, valor, data)
+            messagebox.showinfo("Sucesso", f"Depósito de R$ {valor:.2f} realizado com sucesso.")
+            self.exibirTransacoesBancarias()
         else:
-            self.labelStatus.config(text="Nenhuma solicitação ativa", fg='#333333')
-            self.btnConfirmar.config(state='normal')
-            self.btnCancelar.config(state='disabled')
+            self.solicitarDataAgendamento("Depósito", valor)
+
+    def criarMenuSaque(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "SAQUE")
+        self._rotulo(tela, "Valor do saque:")
+        self.recebeValorSaque = tk.Entry(tela)
+        self.recebeValorSaque.pack(fill="x", ipady=8)
+        self._botao(tela, "SACAR HOJE", lambda: self.processarSaque("hoje")).pack(pady=12)
+        self._botao(tela, "PROGRAMAR SAQUE", lambda: self.processarSaque("programar"), destaque=False).pack(pady=8)
+        self._botao(tela, "CANCELAR", self.exibirTransacoesBancarias, danger=True).pack(pady=8)
+        self.recebeValorSaque.focus_set()
+
+    def processarSaque(self, tipoSaque: str):
+        try:
+            valor = float(self.recebeValorSaque.get().strip().replace(",", "."))
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erro", "Digite um valor numérico positivo.")
+            return
+
+        if tipoSaque == "programar":
+            self.solicitarDataAgendamento("Saque", valor)
+            return
+
+        permitir_cheque = True
+        if isinstance(self.contaLogin, ContaCorrente) and valor > self.contaLogin.saldoAtual:
+            necessario = valor - self.contaLogin.saldoAtual
+            if necessario > self.contaLogin.limiteChequeEspecial:
+                messagebox.showerror("Erro", "Saldo + cheque especial insuficientes.")
+                return
+            permitir_cheque = messagebox.askyesno(
+                "Cheque Especial",
+                f"O saldo atual não cobre o saque.\n\n"
+                f"Valor do saque: R$ {valor:.2f}\n"
+                f"Uso do cheque especial: R$ {necessario:.2f}\n"
+                f"Limite restante: R$ {self.contaLogin.limiteChequeEspecial:.2f}\n\n"
+                "Deseja continuar?",
+            )
+            if not permitir_cheque:
+                return
+
+        ok, usado = Conta.sacar(self.contaLogin, valor, date.today(), permitir_cheque=permitir_cheque)
+        if not ok:
+            messagebox.showerror("Erro", "Saldo insuficiente.")
+            return
+        messagebox.showinfo("Sucesso", f"Saque de R$ {valor:.2f} realizado.\nCheque especial utilizado: R$ {usado:.2f}")
+        self.exibirTransacoesBancarias()
+
+    def criarMenuTransferir(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "TRANSFERÊNCIA")
+        self._rotulo(tela, "Conta beneficiada:")
+        self.entryContaDestino = tk.Entry(tela)
+        self.entryContaDestino.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Valor:")
+        self.entryValorTransferencia = tk.Entry(tela)
+        self.entryValorTransferencia.pack(fill="x", ipady=8)
+        self._botao(tela, "TRANSFERIR AGORA", lambda: self.processarTransferencia("hoje")).pack(pady=12)
+        self._botao(tela, "PROGRAMAR TRANSFERÊNCIA", lambda: self.processarTransferencia("programar"), destaque=False).pack(pady=8)
+        self._botao(tela, "CANCELAR", self.exibirTransacoesBancarias, danger=True).pack(pady=8)
+
+    def processarTransferencia(self, tipoTransferencia: str):
+        destino_numero = self.entryContaDestino.get().strip().upper()
+        if not destino_numero:
+            messagebox.showerror("Erro", "Informe a conta destino.")
+            return
+        destino = Administrador.buscarConta(destino_numero)
+        if destino is None:
+            messagebox.showerror("Erro", "Conta destino não encontrada.")
+            return
+        if destino is self.contaLogin:
+            messagebox.showerror("Erro", "Não é possível transferir para a própria conta.")
+            return
+
+        try:
+            valor = float(self.entryValorTransferencia.get().strip().replace(",", "."))
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erro", "Digite um valor numérico positivo.")
+            return
+
+        if tipoTransferencia == "programar":
+            try:
+                data = self._pedir_data()
+                self.contaLogin.agendar("Transferência", valor, data, destino.numeroConta)
+                messagebox.showinfo("Sucesso", f"Transferência agendada para {data.strftime('%d/%m/%Y')}.")
+                self.exibirTransacoesBancarias()
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc))
+            return
+
+        permitir_cheque = True
+        if isinstance(self.contaLogin, ContaCorrente) and valor > self.contaLogin.saldoAtual:
+            necessario = valor - self.contaLogin.saldoAtual
+            if necessario > self.contaLogin.limiteChequeEspecial:
+                messagebox.showerror("Erro", "Saldo + cheque especial insuficientes.")
+                return
+            permitir_cheque = messagebox.askyesno(
+                "Cheque Especial",
+                f"Será utilizado cheque especial no valor de R$ {necessario:.2f}.\nDeseja continuar?",
+            )
+            if not permitir_cheque:
+                return
+
+        ok, usado = transferir(self.contaLogin, destino, valor, date.today(), permitir_cheque=permitir_cheque)
+        if not ok:
+            messagebox.showerror("Erro", "Transferência não realizada por insuficiência de saldo.")
+            return
+        messagebox.showinfo("Sucesso", f"Transferência de R$ {valor:.2f} realizada.\nCheque especial utilizado: R$ {usado:.2f}")
+        self.exibirTransacoesBancarias()
+
+    def solicitarDataAgendamento(self, tipo: str, valor: float):
+        top = tk.Toplevel(self.janelaPrincipal)
+        top.title(f"Programar {tipo}")
+        top.geometry("340x180")
+        top.transient(self.janelaPrincipal)
+        top.grab_set()
+        tk.Label(top, text="Data (DD/MM/AAAA):").pack(pady=12)
+        entrada = tk.Entry(top)
+        entrada.pack(pady=5)
+
+        def confirmar():
+            try:
+                data_agendada = datetime.strptime(entrada.get().strip(), "%d/%m/%Y").date()
+                self.contaLogin.agendar(tipo, valor, data_agendada)
+                top.destroy()
+                messagebox.showinfo("Sucesso", f"{tipo} agendado para {data_agendada.strftime('%d/%m/%Y')}.")
+                self.exibirTransacoesBancarias()
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc))
+
+        tk.Button(top, text="Confirmar", command=confirmar).pack(pady=10)
+        entrada.focus_set()
+
+    def _pedir_data(self) -> date:
+        # Janela modal simples e síncrona via wait_window.
+        top = tk.Toplevel(self.janelaPrincipal)
+        top.title("Data da transferência")
+        top.geometry("340x180")
+        top.transient(self.janelaPrincipal)
+        top.grab_set()
+        result: dict[str, Optional[date]] = {"data": None}
+        tk.Label(top, text="Data (DD/MM/AAAA):").pack(pady=12)
+        entrada = tk.Entry(top)
+        entrada.pack(pady=5)
+
+        def confirmar():
+            try:
+                data = datetime.strptime(entrada.get().strip(), "%d/%m/%Y").date()
+                if data <= date.today():
+                    raise ValueError("A data deve ser futura.")
+                result["data"] = data
+                top.destroy()
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc), parent=top)
+
+        tk.Button(top, text="Confirmar", command=confirmar).pack(pady=10)
+        entrada.focus_set()
+        self.janelaPrincipal.wait_window(top)
+        if result["data"] is None:
+            raise ValueError("Operação cancelada.")
+        return result["data"]
+
+    # ---------------- DEPÓSITO EXPRESS ----------------
+    def criarMenuDepositoExpress(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "DEPÓSITO EXPRESS")
+        tk.Label(tela, text="Faça um depósito sem login.", bg=self.BG, fg=self.TEXT).pack(pady=(0, 12))
+        self._rotulo(tela, "Número da conta:")
+        self.recebeNumeroDaConta = tk.Entry(tela)
+        self.recebeNumeroDaConta.pack(fill="x", ipady=8)
+        self._rotulo(tela, "Valor do depósito:")
+        self.recebeValorDeposito = tk.Entry(tela)
+        self.recebeValorDeposito.pack(fill="x", ipady=8)
+        self._rotulo(tela, "CPF do depositante:")
+        self.recebeCPFDepositante = tk.Entry(tela)
+        self.recebeCPFDepositante.pack(fill="x", ipady=8)
+        self._botao(tela, "EFETUAR DEPÓSITO", self.processarDepositoSemLogar).pack(pady=18)
+        self._botao(tela, "CANCELAR", self.criarMenuPrincipal, danger=True).pack(pady=8)
+
+    def processarDepositoSemLogar(self):
+        numero_conta = self.recebeNumeroDaConta.get().strip().upper()
+        cpf = self.recebeCPFDepositante.get().strip()
+        valor_texto = self.recebeValorDeposito.get().strip().replace(",", ".")
+        if not numero_conta or not cpf or not valor_texto:
+            messagebox.showerror("Erro", "Todos os campos devem ser preenchidos.")
+            return
+        if Conta.validarCpfDepositante(cpf) is None:
+            messagebox.showerror("Erro", "CPF deve conter 11 dígitos numéricos.")
+            return
+        conta = Administrador.buscarConta(numero_conta)
+        if conta is None:
+            messagebox.showerror("Erro", "Conta não encontrada.")
+            return
+        try:
+            valor = float(valor_texto)
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erro", "Valor inválido para depósito.")
+            return
+
+        Conta.depositar(conta, valor, date.today(), f"CPF depositante: {Conta.validarCpfDepositante(cpf)}")
+        messagebox.showinfo("Sucesso", f"Depósito de R$ {valor:.2f} realizado na conta {conta.numeroConta}.")
+        self.criarMenuPrincipal()
+
+    # ---------------- ENDEREÇO ----------------
+    def criaMenuAlteracaoEndereco(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "ALTERAR ENDEREÇO")
+        tk.Label(
+            tela,
+            text="A alteração será refletida em todas as suas contas com o mesmo titular e CPF.",
+            bg=self.BG,
+            fg=self.TEXT,
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
+        self._rotulo(tela, "Novo endereço completo:")
+        self.entryNovoEndereco = tk.Entry(tela)
+        self.entryNovoEndereco.pack(fill="x", ipady=8)
+        self._botao(tela, "CONFIRMAR ALTERAÇÃO", self.processarAlteracaoEndereco).pack(pady=18)
+        self._botao(tela, "VOLTAR", self.exibirMenuCliente, destaque=False).pack(pady=8)
+
+    def processarAlteracaoEndereco(self):
+        novo = self.entryNovoEndereco.get().strip()
+        try:
+            contas_alteradas = Administrador.alterarEnderecoPorNome(self.contaLogin.titularConta, novo, self.contaLogin.cpf)
+            if contas_alteradas == 0:
+                raise ValueError("Nenhuma conta encontrada para alteração.")
+            messagebox.showinfo("Sucesso", f"Endereço atualizado em {contas_alteradas} conta(s).")
+            self.exibirInformacoesContaCliente()
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
+
+    # ---------------- EXCLUSÃO ----------------
+    def criaMenuExclusaoConta(self):
+        tela = self._nova_tela()
+        self._cabecalho(tela, "EXCLUSÃO DA CONTA")
+        status = Administrador.verificarStatusExclusao(self.contaLogin.numeroConta)
+        texto = status
+        if self.contaLogin.solicitacaoExclusao:
+            texto += f"\nEnviada em: {self.contaLogin.solicitacaoExclusao['data']}"
+        self.labelStatus = tk.Label(tela, text=texto, bg=self.BG, fg=self.TEXT, wraplength=460)
+        self.labelStatus.pack(pady=15)
+
+        pendente = self.contaLogin.solicitacaoExclusao is not None
+        self._botao(tela, "SOLICITAR EXCLUSÃO", self.confirmarExclusaoConta, destaque=not pendente).pack(pady=8)
+        self._botao(tela, "CANCELAR SOLICITAÇÃO", self.cancelarExclusaoConta, destaque=True).pack(pady=8)
+        self._botao(tela, "VOLTAR", self.exibirMenuCliente, destaque=False).pack(pady=15)
 
     def confirmarExclusaoConta(self):
         try:
             self.contaLogin.solicitarExclusaoConta()
-            self.atualizarStatusExclusao()
-        except ValueError as e:
-            self.labelStatus.config(text=str(e), fg='#CC0000')
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha inesperada:\n{str(e)}")
+            messagebox.showinfo("Sucesso", "Solicitação enviada ao administrador.")
+            self.criaMenuExclusaoConta()
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
 
     def cancelarExclusaoConta(self):
         try:
-            if hasattr(self.contaLogin, 'solicitacaoExclusao'):
-                Administrador.cancelarSolicitacao(self.contaLogin.numeroConta)
-                del self.contaLogin.solicitacaoExclusao
-                self.labelStatus.config(text="Solicitação cancelada com sucesso!", fg='#006600')
-                self.janelaPrincipal.after(2000, self.atualizarStatusExclusao)
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha ao cancelar:\n{str(e)}")
-    
-#---------------------------------DEPÓSITO LOGADO---------------------------------   
+            Administrador.cancelarSolicitacao(self.contaLogin.numeroConta)
+            self.contaLogin.solicitacaoExclusao = None
+            messagebox.showinfo("Sucesso", "Solicitação cancelada.")
+            self.criaMenuExclusaoConta()
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
 
-    def criarMenuDepositoLogado(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginCliente")
-        self.ocultarFrame("trasacoesBancarias")
-        self.ocultarFrame("informacoesContaCliente")  
-        
-        self.menuDepositoLogado = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        
-        tk.Label(self.menuDepositoLogado, text="DEPÓSITO", bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(0,10))
-        
-        tk.Label(self.menuDepositoLogado, text="Valor do depósito:", bg='#E3F2F9').pack(anchor="w", padx=15)
-        self.recebeValorDepositoLogado = tk.Entry(self.menuDepositoLogado, width=300)
-        self.recebeValorDepositoLogado.pack(ipady=10, padx=15, pady=(0,15))
-        
-        tk.Button(self.menuDepositoLogado, text="DEPOSITAR HOJE", bg="#78D1DE", height=3, width=300, command=lambda: self.processarDeposito("hoje")).pack(padx=15, pady=(25,5))
-        tk.Button(self.menuDepositoLogado, text="PROGRAMAR DEPÓSITO",bg='#E3F2F9', height=3, width=300, command=lambda: self.processarDeposito("programar")).pack(padx=15, pady=(25,5))
-        tk.Button(self.menuDepositoLogado, text="CANCELAR", bg='#D26060', height=3, width=300, command=self.exibirTransacoesBancarias).pack(padx=15, pady=15)
-        
-        self.menuDepositoLogado.pack()
-
-    def processarDeposito(self, tipoDeposito):
-        valor = self.recebeValorDepositoLogado.get()
-        
-        if not self.validarValorDeposito(valor):
-            return
-        
-        if tipoDeposito == "hoje":
-            data = date.today().strftime("%d/%m/%Y")
-            self.executarDeposito(float(valor), data)
-        else:
-            self.solicitarDataDeposito(float(valor))
-
-    def validarValorDeposito(self, valor):
-        try:
-            valor_float = float(valor)
-            if valor_float <= 0:
-                messagebox.showerror("Erro", "O valor deve ser positivo!")
-                return False
-            return True
-        except ValueError:
-            messagebox.showerror("Erro", "Valor inválido! Digite um número.")
-            return False
-
-    def executarDeposito(self, valor, data):
-        try:
-            # Verifica se o valor é positivo
-            if valor <= 0:
-                messagebox.showerror("Erro", "O valor do depósito deve ser positivo.")
-                return
-
-            valor_depositado_total = valor  # Guarda o valor original para exibição
-            
-            # Para contas corrente: repõe cheque especial primeiro
-            if hasattr(self.contaLogin, 'limiteChequeEspecial'):
-                # Verifica se há limite original definido, senão usa o atual como referência
-                limite_original = getattr(self.contaLogin, 'limiteChequeEspecialOriginal', 
-                                    self.contaLogin.limiteChequeEspecial)
-                
-                # Calcula quanto falta para repor totalmente o cheque especial
-                deficit_cheque_especial = limite_original - self.contaLogin.limiteChequeEspecial
-                
-                if deficit_cheque_especial > 0:
-                    # Repõe o cheque especial com parte ou todo o valor depositado
-                    valor_repor = min(valor, deficit_cheque_especial)
-                    self.contaLogin.limiteChequeEspecial += valor_repor
-                    valor -= valor_repor  # Subtrai do valor a ser depositado
-
-            # Deposita o valor restante na conta
-            self.contaLogin.saldoAtual += valor
-            
-            # Registra a transação no histórico
-            transacao = f"Depósito - R$ {valor_depositado_total:.2f} - {data}"
-            self.contaLogin.adicionaTransacaoHistorico(transacao)
-            
-            # Prepara mensagem de sucesso
-            mensagem = f"Depósito de R${valor_depositado_total:.2f} realizado!\n"
-            mensagem += f"Saldo atual: R${self.contaLogin.saldoAtual:.2f}"
-            
-            if hasattr(self.contaLogin, 'limiteChequeEspecial'):
-                mensagem += f"\nCheque especial disponível: R${self.contaLogin.limiteChequeEspecial:.2f}"
-            
-            messagebox.showinfo("Sucesso", mensagem)
-            
-            # Atualiza a interface se necessário
-            if hasattr(self, 'textoExtrato'):
-                self.atualizarExibicaoExtrato()
-                
-            self.exibirTransacoesBancarias()  # Volta ao menu
-
-        except Exception as e:
-            messagebox.showerror("Erro", f"Ocorreu um erro ao realizar o depósito: {str(e)}")
-    
-    def solicitarDataDeposito(self, valor):
-        top = tk.Toplevel()
-        top.title("Programar Depósito")
-        top.geometry("300x200")
-        
-        tk.Label(top, text="Data (DD/MM/AAAA):").pack(pady=10)
-        entrada_data = tk.Entry(top)
-        entrada_data.pack(pady=5)
-        
-        def confirmar():
-            dataStr = entrada_data.get()
-            try:
-                data = datetime.strptime(dataStr, "%d/%m/%Y").date()
-                if data < date.today():
-                    messagebox.showerror("Erro", "Data deve ser futura!")
-                else:
-                    top.destroy()
-                    self.executarDeposito(valor, data.strftime("%d/%m/%Y"))
-            except ValueError:
-                messagebox.showerror("Erro", "Formato inválido! Use DD/MM/AAAA")
-        
-        tk.Button(top, text="Confirmar", command=confirmar).pack(pady=10)
-        
-#---------------------------------SAQUE---------------------------------   
-
-    def criarMenuSaque(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginCliente")
-        self.ocultarFrame("trasacoesBancarias")
-        self.ocultarFrame("informacoesContaCliente")        
-
-        self.menuSaque = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        
-        # Componentes da interface
-        tk.Label(self.menuSaque, text="SAQUE", bg='#E3F2F9',font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(0,10))
-        
-        tk.Label(self.menuSaque, text="Valor do saque:", bg='#E3F2F9').pack(anchor="w", padx=15)
-        self.recebeValorSaque = tk.Entry(self.menuSaque, width=300)
-        self.recebeValorSaque.pack(ipady=10, padx=15, pady=(0,15))
-        
-        tk.Button(self.menuSaque, text="SACAR HOJE", bg="#78D1DE", height=3, width=300, command=lambda: self.processarSaque("hoje")).pack(padx=15, pady=(25,5))
-        
-        tk.Button(self.menuSaque, text="PROGRAMAR SAQUE",bg='#E3F2F9', height=3, width=300, command=lambda: self.processarSaque("programar")).pack(padx=15, pady=(25,5))
-        
-        tk.Button(self.menuSaque, text="CANCELAR", bg='#D26060', height=3, width=300, command=self.exibirTransacoesBancarias).pack(padx=15, pady=15)
-        
-        self.menuSaque.pack()
-
-        #Adicionado recentemente
-        self.recebeValorSaque.focus_set()
-        if self.contaLogin.saldoAtual < 0:
-            messagebox.showwarning("Aviso", "Você está no cheque especial.\nNovos saques podem ser limitados.")
-            self.btnSacarHoje.config(state='disabled', bg='#CCCCCC')
-        
-    def processarSaque(self, tipoSaque):
-        try:
-            valor = self.recebeValorSaque.get()
-            
-            if not self.validarValorSaque(valor):
-                return
-            
-            if tipoSaque == "hoje":
-                data = date.today().strftime("%d/%m/%Y")
-                self.executarSaque(float(valor), data)
-            else:
-                self.solicitarDataSaque(float(valor))
-        except Exception as e:
-            messagebox.showerror("Erro", f"Ocorreu um erro inesperado: {str(e)}")
-            print(f"Erro detalhado: {e}")
-
-    def validarValorSaque(self, valor):
-        try:
-            valorFloat = float(valor)
-            if valorFloat <= 0:
-                self.recebeValorSaque.config(bg='#FFDDDD')  # Fundo vermelho claro
-                messagebox.showerror("Erro", "Valor deve ser positivo!")
-                return False
-            self.recebeValorSaque.config(bg='white')  # Reset ao acertar
-            return True
-        except ValueError:
-            self.recebeValorSaque.config(bg='#FFDDDD')
-            messagebox.showerror("Erro", "Valor inválido! Digite um número.")
-            return False
-
-    def executarSaque(self, valor, data):
-        if self.contaLogin.tipoContaCriada.upper() == "CORRENTE":
-            self.processarSaqueContaCorrente(valor, data)
-        else:
-            self.processarSaquePoupanca(valor, data)
-
-    def processarSaqueContaCorrente(self, valor, data):
-        saldoTotal = self.contaLogin.saldoAtual + self.contaLogin.limiteChequeEspecial
-        
-        if valor > saldoTotal:
-            messagebox.showerror("Erro", f"Saldo total insuficiente (R${saldoTotal:.2f})")
-            self.recebeValorSaque.delete(0, tk.END)
-            self.recebeValorSaque.focus_set()
-            return
-        
-        try:
-            if valor <= self.contaLogin.saldoAtual:
-                # Saque normal
-                self.contaLogin.saldoAtual -= valor
-                self.contaLogin.adicionaTransacaoHistorico(f"Saque - R${valor:.2f} - {data}")
-                mensagem = f"Saque de R${valor:.2f} realizado!\nNovo saldo: R${self.contaLogin.saldoAtual:.2f}"
-            else:
-                # Usar cheque especial
-                self.utilizarChequeEspecial(valor, data)
-                mensagem = f"Saque com cheque especial realizado!\nSaldo atual: R${self.contaLogin.saldoAtual:.2f}\nLimite restante: R${self.contaLogin.limiteChequeEspecial:.2f}"
-            
-            # Atualização completa da interface
-            self.recebeValorSaque.delete(0, tk.END)
-            messagebox.showinfo("Sucesso", mensagem)
-            self.exibirTransacoesBancarias(refresh=True)  # Força atualização
-            
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha no saque: {str(e)}")
-            self.recebeValorSaque.focus_set()
-
-
-    def utilizarChequeEspecial(self, valor, data):
-        resposta = messagebox.askyesno(
-            "Cheque Especial", 
-            f"Saldo insuficiente. Usar cheque especial?\n"
-            f"Valor necessário: R$ {valor - self.contaLogin.saldoAtual:.2f}\n"
-            f"Limite disponível: R$ {self.contaLogin.limiteChequeEspecial:.2f}")
-        
-        if not resposta:
-            self.recebeValorSaque.delete(0, tk.END)
-            self.recebeValorSaque.focus_set()
-            return
-
-        valorCheque = valor - self.contaLogin.saldoAtual
-        self.contaLogin.saldoAtual -= valor  # Isso deixará o saldo negativo
-        self.contaLogin.limiteChequeEspecial -= valorCheque
-        
-        self.contaLogin.adicionaTransacaoHistorico(
-            f"Saque com Cheque Especial - R$ {valor:.2f} - {data}")
-        
-        messagebox.showinfo("Sucesso", 
-            f"Saque realizado!\n"
-            f"Saldo atual: -R$ {abs(self.contaLogin.saldoAtual):.2f}\n"
-            f"Limite restante: R$ {self.contaLogin.limiteChequeEspecial:.2f}")
-        
-        self.exibirTransacoesBancarias()
-        self.atualizarExibicaoExtrato()
-
-    def processarSaquePoupanca(self, valor, data):
-        if valor > self.contaLogin.saldoAtual:
-            messagebox.showerror("Erro", f"Saldo insuficiente (R${self.contaLogin.saldoAtual:.2f})")
-            self.recebeValorSaque.delete(0, tk.END)
-            self.recebeValorSaque.focus_set()
-            return
-        
-        self.contaLogin.saldoAtual -= valor
-        # Adicione esta linha:
-        self.contaLogin.adicionaTransacaoHistorico(f"Saque - R$ {valor:.2f} - {data}")
-        messagebox.showinfo("Sucesso", f"Saque de R${valor:.2f} realizado!\nNovo saldo: R${self.contaLogin.saldoAtual:.2f}")
-        self.exibirMenuCliente()
-        self.atualizarExibicaoExtrato()
-
-    def solicitarDataSaque(self, valor):
-        top = tk.Toplevel()
-        top.title("Programar Saque")
-        top.geometry("300x200")
-        
-        tk.Label(top, text="Data (DD/MM/AAAA):").pack(pady=10)
-        entradaData = tk.Entry(top)
-        entradaData.pack(pady=5)
-        
-        def confirmar():
-            dataStr = entradaData.get()
-            try:
-                data = datetime.strptime(dataStr, "%d/%m/%Y").date()
-                if data < date.today():
-                    messagebox.showerror("Erro", "Data deve ser futura!")
-                else:
-                    top.destroy()
-                    self.executarSaque(valor, data.strftime("%d/%m/%Y"))
-            except ValueError:
-                messagebox.showerror("Erro", "Formato inválido! Use DD/MM/AAAA")
-        
-        tk.Button(top, text="Confirmar", command=confirmar).pack(pady=10)
-
-#---------------------------------TRANSFERÊNCIA---------------------------------   
-    def criarMenuTransferir(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuLogin")
-        self.ocultarFrame("menuLoginCliente")
-        self.ocultarFrame("trasacoesBancarias")
-        self.ocultarFrame("informacoesContaCliente")      
-
-        self.menuTransferir = tk.Frame(self.janelaPrincipal, bg='#E3F2F9', height=600, width=380)
-        
-        # Componentes da interface
-        tk.Label(self.menuTransferir, text="TRANSFERÊNCIA", bg='#E3F2F9', font=('Arial', 12, 'bold')).pack(pady=(10,20))
-        
-        # Conta destino
-        tk.Label(self.menuTransferir, text="Conta beneficiada:", bg='#E3F2F9').pack(anchor="w", padx=15)
-        self.entryContaDestino = tk.Entry(self.menuTransferir, width=300)
-        self.entryContaDestino.pack(ipady=10, padx=15, pady=(0,15))
-        
-        # Valor
-        tk.Label(self.menuTransferir, text="Valor:", bg='#E3F2F9').pack(anchor="w", padx=15)
-        self.entryValorTransferencia = tk.Entry(self.menuTransferir, width=300)
-        self.entryValorTransferencia.pack(ipady=10, padx=15, pady=(0,15))
-        
-        # Botões
-        tk.Button(self.menuTransferir, text="TRANSFERIR AGORA", bg="#78D1DE", height=3, width=300,command=lambda: self.processarTransferencia("hoje")).pack(padx=15, pady=(25,5))
-        
-        tk.Button(self.menuTransferir, text="PROGRAMAR TRANSFERÊNCIA",bg='#E3F2F9', height=3, width=300,command=lambda: self.processarTransferencia("programar")).pack(padx=15, pady=(25,5))
-        
-        tk.Button(self.menuTransferir, text="CANCELAR", bg='#D26060', height=3, width=300,command=self.exibirTransacoesBancarias).pack(padx=15, pady=15)
-        
-        self.menuTransferir.pack()
-
-    def processarTransferencia(self, tipoTransferencia):
-        contaDestino = self.entryContaDestino.get().strip().upper()
-        valor_str = self.entryValorTransferencia.get().strip()
-        
-        if not self.validarDadosTransferencia(contaDestino, valor_str):
-            return
-        
-        valor = float(valor_str)
-        
-        if tipoTransferencia == "hoje":
-            data = date.today().strftime("%d/%m/%Y")
-            self.executarTransferencia(contaDestino, valor, data)
-        else:
-            self.solicitarDataTransferencia(contaDestino, valor)
-
-    def validarDadosTransferencia(self, contaDestino, valor_str):
-        if not contaDestino:
-            messagebox.showerror("Erro", "Informe a conta destino!")
-            return False
-        
-        try:
-            valor = float(valor_str)
-            if valor <= 0:
-                messagebox.showerror("Erro", "Valor deve ser positivo!")
-                return False
-            return True
-        except ValueError:
-            messagebox.showerror("Erro", "Valor inválido! Digite um número.")
-            return False
-
-    def executarTransferencia(self, contaDestino, valor, data):
-        # Verifica se não está transferindo para si mesmo
-        if contaDestino == self.contaLogin.numeroConta:
-            messagebox.showerror("Erro", "Não é possível transferir para a própria conta!")
-            return
-        
-        # Encontra a conta destino
-        contaDestino_obj = None
-        for conta in Administrador.get__contasCorrenteCadastradas() + Administrador.get__contasPoupancaCadastradas():
-            if conta.numeroConta == contaDestino:
-                contaDestino_obj = conta
-                break
-        
-        if not contaDestino_obj:
-            messagebox.showerror("Erro", "Conta destino não encontrada!")
-            return
-        
-        # Verifica saldo e cheque especial (se conta corrente)
-        if isinstance(self.contaLogin, ContaCorrente):
-            saldo_total = self.contaLogin.saldoAtual + self.contaLogin.limiteChequeEspecial
-            
-            if valor > saldo_total:
-                messagebox.showerror("Erro", f"Saldo total insuficiente (R${saldo_total:.2f})")
-                return
-            
-            if valor > self.contaLogin.saldoAtual:
-                self.usarChequeEspecialTransferencia(contaDestino_obj, valor, data)
-                return
-        
-        # Executa transferência normal
-        self.contaLogin.saldoAtual -= valor
-        contaDestino_obj.saldoAtual += valor
-        
-        # Registra transações
-        operacao_origem = f"Transferência - R${valor:.2f} - {data} - Para: {contaDestino_obj.numeroConta}"
-        operacao_destino = f"Transferência recebida - R${valor:.2f} - {data} - De: {self.contaLogin.numeroConta}"
-        
-        self.contaLogin.adicionaTransacaoHistorico(operacao_origem)
-        contaDestino_obj.adicionaTransacaoHistorico(operacao_destino)
-        
-        messagebox.showinfo("Sucesso", f"Transferência de R${valor:.2f} realizada com sucesso!")
-        self.exibirTransacoesBancarias()
-        self.atualizarExibicaoExtrato()  # Atualiza o extrato
-
-    def usarChequeEspecialTransferencia(self, contaDestino, valor, data):
-        resposta = messagebox.askyesno(
-            "Cheque Especial", 
-            f"Saldo insuficiente. Usar cheque especial?\n\n"
-            f"Valor necessário: R${valor:.2f}\n"
-            f"Saldo disponível: R${self.contaLogin.saldoAtual:.2f}\n"
-            f"Limite cheque especial: R${self.contaLogin.limiteChequeEspecial:.2f}"
-        )
-        
-        if resposta:
-            valor_cheque = valor - self.contaLogin.saldoAtual
-            self.contaLogin.saldoAtual = 0
-            self.contaLogin.limiteChequeEspecial -= valor_cheque
-            
-            contaDestino.saldoAtual += valor
-            
-            # Registra transações
-            operacao_origem = f"Transferência (cheque especial) - R${valor:.2f} - {data} - Para: {contaDestino.numeroConta}"
-            operacao_destino = f"Transferência recebida - R${valor:.2f} - {data} - De: {self.contaLogin.numeroConta}"
-            
-            self.contaLogin.adicionaTransacaoHistorico(operacao_origem)
-            contaDestino.adicionaTransacaoHistorico(operacao_destino)
-            
-            messagebox.showinfo("Sucesso", 
-                f"Transferência realizada com cheque especial!\n\n"
-                f"Valor: R${valor:.2f}\n"
-                f"Cheque especial utilizado: R${valor_cheque:.2f}\n"
-                f"Limite restante: R${self.contaLogin.limiteChequeEspecial:.2f}")
-            
-            # Atualiza apenas a interface da conta ORIGEM (a logada)
-            self.exibirTransacoesBancarias()
-
-    def solicitarDataTransferencia(self, contaDestino, valor):
-        top = tk.Toplevel(self.janelaPrincipal)
-        top.title("Programar Transferência")
-        top.geometry("300x200")
-        
-        tk.Label(top, text="Data (DD/MM/AAAA):").pack(pady=10)
-        entry_data = tk.Entry(top)
-        entry_data.pack(pady=5)
-        
-        def confirmar():
-            dataStr = entry_data.get()
-            try:
-                data = datetime.strptime(dataStr, "%d/%m/%Y").date()
-                if data < date.today():
-                    messagebox.showerror("Erro", "Data deve ser futura!")
-                else:
-                    top.destroy()
-                    self.executarTransferencia(contaDestino, valor, data.strftime("%d/%m/%Y"))
-            except ValueError:
-                messagebox.showerror("Erro", "Formato inválido! Use DD/MM/AAAA")
-        
-        tk.Button(top, text="Confirmar", command=confirmar).pack(pady=10)
-
-#---------------------------------DEPÓSITO EXPRESS---------------------------------   
-    def criarMenuDepositoExpress(self):
-        self.ocultarFrame("menuPrincipal")
-
-        self.menuDepositoExpress = tk.Frame(self.janelaPrincipal,bg='#E3F2F9',height=600, width=380)
-        
-        #Título da janela
-        tk.Label(self.menuDepositoExpress, text="DEPÓSITO EXPRES", bg='#E3F2F9', pady=5,font=('Arial',12, 'bold'),fg='#223C5E').pack(pady=(0,10))
-        tk.Label(self.menuDepositoExpress, text="Depósito rápido e sem burocracia", bg='#E3F2F9').pack()
-        tk.Label(self.menuDepositoExpress, text="Faça sem login ou cadastro.", bg='#E3F2F9').pack(pady=(0,20))
-
-        #---------------------------------ENTRADAS---------------------------------
-
-        #Entrada para o número da conta
-        tk.Label(self.menuDepositoExpress, text="Digite o número da conta: ", bg='#E3F2F9',pady=5, justify="left").pack(anchor="w",padx=15)
-        self.recebeNumeroDaConta = tk.Entry(self.menuDepositoExpress, width=300)
-        self.recebeNumeroDaConta.pack(ipady=10,padx=15,pady=(0,15))
-
-        #Label deposito
-        tk.Label(self.menuDepositoExpress, text="Valor do depósito: ", bg='#E3F2F9', pady=5, justify="left").pack(anchor="w",padx=15)
-        
-        #Entry depósito
-        self.recebeValorDeposito = tk.Entry(self.menuDepositoExpress, width=300)
-        self.recebeValorDeposito.pack(ipady=10, padx=15,pady=(0,15))
-
-        #Label CPF
-        tk.Label(self.menuDepositoExpress, text="Digite o seu CPF: ", bg='#E3F2F9',pady=5, justify="left").pack(anchor="w",padx=15)
-
-        #Entry CPF
-        self.recebeCPFDepositante = tk.Entry(self.menuDepositoExpress, width=300)
-        self.recebeCPFDepositante.pack(ipady=10,padx=15)
-        self.menuDepositoExpress.pack(padx=20, pady=20) #Se quiser oculta-lo, retiro essa linha
-        tk.Button(self.menuDepositoExpress, text="EFETUAR DEPÓSITO", bg="#78D1DE", height=3, width=300, command=self.processarDepositoSemLogar).pack(padx=15, pady=(25,5))
-        tk.Button(self.menuDepositoExpress, text="CANCELAR DEPÓSITO",bg='#D26060', height=3, width=300, command=self.criarMenuPrincipal).pack(padx=15, pady=15)
-    
-    def processarDepositoSemLogar(self):
-        numero_conta = self.recebeNumeroDaConta.get().strip().upper()
-        cpf = self.recebeCPFDepositante.get().strip()
-        valor = self.recebeValorDeposito.get().strip().replace(",", ".")
-        
-        # Chama o método da classe Conta corretamente
-        if Conta.depositarSemlogar(numero_conta, cpf, valor):
-            self.criarMenuPrincipal()
-
-#---------------------------------EXTRATO BANCÁRIO---------------------------------   
+    # ---------------- EXTRATO ----------------
     def criarMenuExtrato(self):
-        self.ocultarFrame("menuPrincipal")
-        self.ocultarFrame("menuAberturaDeConta")
-        self.ocultarFrame("menuAberturaDeContaCorrentePoupanca")
-        self.ocultarFrame("menuCliente")
-        self.ocultarFrame("trasacoesBancarias")
-        self.ocultarFrame("menuSaque")
-        self.ocultarFrame("menuTransferir")
-        self.ocultarFrame("menuDepositoLogado")
+        tela = self._nova_tela()
+        self._cabecalho(tela, "EXTRATO BANCÁRIO")
 
-
-        self.menuExtrato = tk.Frame(self.janelaPrincipal, bg='#E3F2F9')
-        self.menuExtrato.pack(fill='both', expand=True)
-        
-        # Título
-        tk.Label(self.menuExtrato, text="EXTRATO BANCÁRIO",font=('Arial',12, 'bold'),fg='#223C5E',bg='#E3F2F9').pack(pady=(10,5))
-        
-        # Frame principal do extrato (80% da altura)
-        frameExtrato = tk.Frame(self.menuExtrato, bg='#E3F2F9')
-        frameExtrato.pack(fill='both', expand=True, padx=20, pady=5)
-        
-        # Área de exibição com scrollbar
-        scrollbar = tk.Scrollbar(frameExtrato)
-        self.textoExtrato = tk.Text(frameExtrato, wrap=tk.WORD, yscrollcommand=scrollbar.set,bg='white', height=10, padx=10, pady=10)
+        frame_texto = tk.Frame(tela, bg=self.BG)
+        frame_texto.pack(fill="both", expand=True)
+        scrollbar = tk.Scrollbar(frame_texto)
+        scrollbar.pack(side="right", fill="y")
+        self.textoExtrato = tk.Text(frame_texto, wrap=tk.WORD, yscrollcommand=scrollbar.set, bg="white")
+        self.textoExtrato.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.textoExtrato.yview)
-        
-        self.textoExtrato.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Frame inferior (20% da altura)
-        frameInferior = tk.Frame(self.menuExtrato, bg='#E3F2F9')
-        frameInferior.pack(fill='x', padx=20, pady=5)
-        
-        # Seção de filtro (organizada verticalmente)
-        tk.Label(frameInferior, text="FILTRAR POR PERÍODO", bg='#E3F2F9',font=('Arial', 10, 'bold')).pack(anchor='w')
-        
-        frameDatas = tk.Frame(frameInferior, bg='#E3F2F9')
-        frameDatas.pack(fill='x', pady=5)
-        
-        tk.Label(frameDatas, text="De:", bg='#E3F2F9').pack(side=tk.LEFT)
-        self.entryDataInicial = tk.Entry(frameDatas, width=12)
-        self.entryDataInicial.pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(frameDatas, text="Até:", bg='#E3F2F9').pack(side=tk.LEFT, padx=(10,0))
-        self.entryDataFinal = tk.Entry(frameDatas, width=12)
-        self.entryDataFinal.pack(side=tk.LEFT, padx=5)
-        
-        frameBotoes = tk.Frame(frameInferior, bg='#E3F2F9')
-        frameBotoes.pack(pady=5)
-        
-        btnFiltrar = tk.Button(frameBotoes, text="APLICAR FILTRO",bg='#E3F2F9', command=self.aplicarFiltroExtrato, width=15)
-        btnFiltrar.pack(side=tk.LEFT, padx=5)
-        
-        btnLimpar = tk.Button(frameBotoes, text="LIMPAR FILTRO",bg='#E3F2F9', command=self.limparFiltroExtrato, width=15)
-        btnLimpar.pack(side=tk.LEFT, padx=5)
-        
-        # Botão Voltar (no rodapé)
-        tk.Button(self.menuExtrato, text="VOLTAR",bg='#E3F2F9', command=self.exibirTransacoesBancarias, width=20).pack(pady=10)
-        
-        # Carrega extrato inicial
+
+        filtros = tk.Frame(tela, bg=self.BG)
+        filtros.pack(fill="x", pady=10)
+        tk.Label(filtros, text="Período (DD/MM/AAAA):", bg=self.BG, fg=self.TEXT).pack(anchor="w")
+        linha = tk.Frame(filtros, bg=self.BG)
+        linha.pack(fill="x", pady=5)
+        tk.Label(linha, text="De:", bg=self.BG, fg=self.TEXT).pack(side="left")
+        self.entryDataInicial = tk.Entry(linha, width=12)
+        self.entryDataInicial.pack(side="left", padx=5)
+        tk.Label(linha, text="Até:", bg=self.BG, fg=self.TEXT).pack(side="left", padx=(10, 0))
+        self.entryDataFinal = tk.Entry(linha, width=12)
+        self.entryDataFinal.pack(side="left", padx=5)
+
+        botoes = tk.Frame(tela, bg=self.BG)
+        botoes.pack()
+        tk.Button(botoes, text="APLICAR FILTRO", command=self.aplicarFiltroExtrato, width=15).pack(side="left", padx=4)
+        tk.Button(botoes, text="LIMPAR FILTRO", command=self.limparFiltroExtrato, width=15).pack(side="left", padx=4)
+        self._botao(tela, "VOLTAR", self.exibirTransacoesBancarias, destaque=False).pack(pady=10)
         self.atualizarExibicaoExtrato()
+
+    def _cabecalho_extrato(self) -> str:
+        conta = self.contaLogin
+        texto = (
+            "BANCO DOS UNIVERSITÁRIOS\n"
+            f"Agência: {conta.numeroAgencia}\n"
+            f"Conta: {conta.numeroConta}\n"
+            f"Titular: {conta.titularConta}\n"
+            f"Saldo Atual: R$ {conta.saldoAtual:.2f}\n"
+        )
+        if isinstance(conta, ContaCorrente):
+            texto += f"Cheque Especial Disponível: R$ {conta.limiteChequeEspecial:.2f}\n"
+        return texto + "\nHistórico de Transações:\n" + "=" * 70 + "\n"
+
+    def atualizarExibicaoExtrato(self, transacoes: Optional[list[dict[str, Any]]] = None):
+        if not hasattr(self, "textoExtrato"):
+            return
+        self.textoExtrato.delete("1.0", tk.END)
+        self.textoExtrato.insert(tk.END, self._cabecalho_extrato())
+        lista = self.contaLogin.historico if transacoes is None else transacoes
+        if not lista:
+            self.textoExtrato.insert(tk.END, "Nenhuma transação efetuada.\n")
+            return
+        for transacao in sorted(lista, key=lambda t: t["data"], reverse=True):
+            self.textoExtrato.insert(tk.END, f"• {self.contaLogin.formatar_transacao(transacao)}\n")
+
+    def _ler_periodo(self) -> tuple[date, date]:
+        try:
+            inicio = datetime.strptime(self.entryDataInicial.get().strip(), "%d/%m/%Y").date()
+            fim = datetime.strptime(self.entryDataFinal.get().strip(), "%d/%m/%Y").date()
+        except ValueError as exc:
+            raise ValueError("Use o formato DD/MM/AAAA.") from exc
+        if inicio > fim:
+            raise ValueError("A data inicial não pode ser posterior à data final.")
+        return inicio, fim
+
+    def aplicarFiltroExtrato(self):
+        try:
+            inicio, fim = self._ler_periodo()
+        except ValueError as exc:
+            messagebox.showerror("Erro", str(exc))
+            return
+
+        transacoes = [t for t in self.contaLogin.historico if inicio <= t["data"] <= fim]
+        saldo_projetado = self.contaLogin.saldoAtual
+
+        if isinstance(self.contaLogin, ContaCorrente):
+            taxas = gerar_taxas_corrente(self.contaLogin, inicio, fim)
+            transacoes.extend(taxas)
+            saldo_projetado -= sum(t["valor"] for t in taxas)
+            transacoes.append(
+                {
+                    "tipo": "Saldo projetado",
+                    "valor": saldo_projetado,
+                    "data": fim,
+                    "descricao": "Após taxas projetadas no período",
+                }
+            )
+        else:
+            rendimentos = gerar_rendimentos_poupanca(self.contaLogin, inicio, fim)
+            transacoes.extend(rendimentos)
+            total_rendimento = sum(t["valor"] for t in rendimentos)
+            saldo_projetado += total_rendimento
+            transacoes.append(
+                {
+                    "tipo": "Rendimento total projetado",
+                    "valor": total_rendimento,
+                    "data": fim,
+                    "descricao": "No período filtrado",
+                }
+            )
+            transacoes.append(
+                {
+                    "tipo": "Saldo projetado",
+                    "valor": saldo_projetado,
+                    "data": fim,
+                    "descricao": "Incluindo rendimentos projetados",
+                }
+            )
+
+        self.atualizarExibicaoExtrato(transacoes)
 
     def limparFiltroExtrato(self):
         self.entryDataInicial.delete(0, tk.END)
         self.entryDataFinal.delete(0, tk.END)
         self.atualizarExibicaoExtrato()
 
-    def atualizarExibicaoExtrato(self, transacoes=None):
-        if not hasattr(self, 'textoExtrato'):
-            return
-                
-        try:
-            self.textoExtrato.delete(1.0, tk.END)
-            
-            # Sempre pega o histórico atualizado da conta
-            transacoes = self.contaLogin.historico if transacoes is None else transacoes
-            
-            if not transacoes:
-                self.textoExtrato.insert(tk.END, "Nenhuma transação efetuada")
-                return
-            
-            # Cabeçalho completo (mantido igual)
-            cabecalho = f"{'BANCO DOS UNIVERSITÁRIOS':^50}\n\n"
-            cabecalho += f"Agência: {self.contaLogin.numeroAgencia}\n"
-            cabecalho += f"Conta: {self.contaLogin.numeroConta}\n"
-            cabecalho += f"Titular: {self.contaLogin.titularConta}\n"
-            cabecalho += f"Saldo Atual: R$ {self.contaLogin.saldoAtual:.2f}\n"
-            
-            if hasattr(self.contaLogin, 'limiteChequeEspecial'):
-                cabecalho += f"Cheque Especial Disponível: R$ {self.contaLogin.limiteChequeEspecial:.2f}\n"
-            
-            cabecalho += "\nHistórico de Transações:\n"
-            cabecalho += "="*50 + "\n"
-            
-            self.textoExtrato.insert(tk.END, cabecalho)
-            
-            # Função auxiliar para extração segura de datas
-            def extrair_data(transacao):
-                partes = transacao.split(" - ")
-                # Verifica se é uma transação com CPF (formato diferente)
-                if any("CPF" in parte for parte in partes):
-                    # Padrão: "Tipo - Valor - Data - CPF: xxx"
-                    data_str = partes[-2]  # Pega o penúltimo elemento (data)
-                else:
-                    # Padrão normal: "Tipo - Valor - Data"
-                    data_str = partes[-1]  # Pega o último elemento
-                
-                try:
-                    return datetime.strptime(data_str.strip(), "%d/%m/%Y")
-                except ValueError:
-                    # Se não encontrar data válida, retorna data mínima para aparecer primeiro
-                    return datetime.min
-            
-            # Ordena as transações pela data extraída
-            for transacao in sorted(transacoes, key=extrair_data, reverse=True):
-                self.textoExtrato.insert(tk.END, f"• {transacao}\n")
-                
-            self.textoExtrato.see(tk.END)
-            
-        except Exception as e:
-            print(f"Erro ao atualizar extrato: {str(e)}")
-            # Mensagem amigável ao usuário
-            self.textoExtrato.insert(tk.END, "\nErro ao carregar transações. Formato inválido detectado.")
 
-    def aplicarFiltroExtrato(self):
-        try:
-            if not self.entryDataInicial.get() or not self.entryDataFinal.get():
-                messagebox.showerror("Erro", "Preencha ambas as datas!")
-                return
-
-            # Converter para date (não datetime)
-            dataInicial = datetime.strptime(self.entryDataInicial.get(), "%d/%m/%Y").date()
-            dataFinal = datetime.strptime(self.entryDataFinal.get(), "%d/%m/%Y").date()
-
-            def extrair_data(transacao):
-                partes = transacao.split(" - ")
-                if any("CPF" in parte for parte in partes):
-                    data_str = partes[-2]  # penúltimo é a data
-                else:
-                    data_str = partes[-1]  # último é a data
-                try:
-                    # Retorna date em vez de datetime
-                    return datetime.strptime(data_str.strip(), "%d/%m/%Y").date()
-                except:
-                    return None
-
-            historicoFiltrado = []
-            for t in self.contaLogin.historico:
-                dataTransacao = extrair_data(t)
-                if dataTransacao and dataInicial <= dataTransacao <= dataFinal:
-                    historicoFiltrado.append(t)
-
-            if isinstance(self.contaLogin, ContaCorrente):
-                dataTaxa = date(dataInicial.year, dataInicial.month, 5)
-                if dataInicial.day > 5:
-                    dataTaxa = date(dataTaxa.year, dataTaxa.month + 1 if dataTaxa.month < 12 else 1, 5)
-
-                while dataTaxa <= dataFinal:
-                    historicoFiltrado.append(
-                        f"Taxa de Manutenção Projetada - R$ {self.contaLogin.TAXA_MANUTENCAO:.2f} - {dataTaxa.strftime('%d/%m/%Y')}"
-                    )
-                    if dataTaxa.month == 12:
-                        dataTaxa = date(dataTaxa.year + 1, 1, 5)
-                    else:
-                        dataTaxa = date(dataTaxa.year, dataTaxa.month + 1, 5)
-
-                meses_projecao = (dataFinal.year - dataInicial.year) * 12 + (dataFinal.month - dataInicial.month)
-                if dataFinal.day < dataInicial.day:
-                    meses_projecao -= 1
-                
-                saldo_projetado = self.contaLogin.saldoAtual - (self.contaLogin.TAXA_MANUTENCAO * max(0, meses_projecao))
-                historicoFiltrado.append(f"Saldo projetado após {meses_projecao} meses: R$ {saldo_projetado:.2f}")
-
-            else:
-                for t in historicoFiltrado[:]:
-                    if "Depósito" in t or "Transferência recebida" in t:
-                        partes = t.split(" - ")
-                        try:
-                            valor = float(partes[1].replace("R$", "").strip())
-                            dataTrans = extrair_data(t)
-                            if dataTrans:
-                                meses = (dataFinal.year - dataTrans.year) * 12 + (dataFinal.month - dataTrans.month)
-                                if dataFinal.day < dataTrans.day:
-                                    meses -= 1
-                                
-                                for mes in range(1, max(1, meses) + 1):
-                                    novo_mes = dataTrans.month + mes
-                                    ano = dataTrans.year + (novo_mes - 1) // 12
-                                    mes_final = (novo_mes - 1) % 12 + 1
-                                    ultimo_dia = [31, 29 if ano % 4 == 0 and (ano % 100 != 0 or ano % 400 == 0) else 28, 
-                                                31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mes_final - 1]
-                                    dia = min(dataTrans.day, ultimo_dia)
-                                    dataRendimento = date(ano, mes_final, dia)
-                                    
-                                    rendimento = valor * self.contaLogin.TAXA_RENDIMENTO
-                                    historicoFiltrado.append(
-                                        f"Rendimento (origem: {dataTrans.strftime('%d/%m/%Y')}) - R$ {rendimento:.2f} - {dataRendimento.strftime('%d/%m/%Y')}"
-                                    )
-                        except:
-                            continue
-
-                total_rendimentos = sum(
-                    float(t.split("R$")[1].split("-")[0].strip()) 
-                    for t in historicoFiltrado 
-                    if "Rendimento" in t
-                )
-                historicoFiltrado.append(f"Rendimento total no período: R$ {total_rendimentos:.2f}")
-
-            historicoFiltrado.sort(key=lambda x: extrair_data(x) or date.min)
-            self.atualizarExibicaoExtrato(historicoFiltrado)
-
-        except ValueError as e:
-            messagebox.showerror("Erro", f"Data inválida! Use DD/MM/AAAA\nErro: {str(e)}")
-
-
-    #Padroniza todos os labels, exceto os que contêm imagens
-
-    def padronizarLabels(self, container=None):
-        container = container or self.janelaPrincipal  # Se não especificado, usa a janela principal
-        
-        for widget in container.winfo_children():
-            if isinstance(widget, tk.Label):
-                # Verifica se o label tem imagem antes de modificar
-                if not widget.cget('image'):
-                    widget.config(font=('Arial', 10),fg='#223C5E',bg='#E3F2F9')
-            elif isinstance(widget, (tk.Frame, tk.Toplevel)):
-                self.padronizarLabels(widget)  # Chama recursivamente para containers internos
-
-    
-
-janela = Janela()
-janela.exibirJanela()
-
-
+if __name__ == "__main__":
+    janela = Janela()
+    janela.exibirJanela()
